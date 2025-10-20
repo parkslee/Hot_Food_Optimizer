@@ -1,0 +1,1173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bakery Shift Optimizer</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                    },
+                }
+            }
+        }
+    </script>
+    <!-- Load Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        /* Custom CSS for sticky table headers/columns */
+        .table-container {
+            overflow-x: auto;
+            max-width: 100%;
+        }
+        .schedule-table {
+            border-collapse: separate;
+            border-spacing: 0;
+            min-width: 1200px; /* Ensure space for content */
+        }
+        .schedule-table th, .schedule-table td {
+            border-color: #e5e7eb;
+            padding: 0.5rem 0.75rem;
+            vertical-align: top;
+        }
+        .sticky-col {
+            position: sticky;
+            left: 0;
+            z-index: 20;
+            background-color: #fff;
+        }
+        .schedule-table thead th.sticky-col {
+            z-index: 30;
+            background-color: #eef2ff; /* indigo-50 */
+        }
+    </style>
+</head>
+<body class="bg-gray-50 font-sans">
+    <div id="app" class="p-4 md:p-8">
+        <!-- Content will be rendered here by JavaScript -->
+    </div>
+    
+    <!-- Modal for adding new staff -->
+    <div id="add-staff-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50 transition-opacity duration-300">
+        <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-sm transform transition-transform duration-300 scale-100" onclick="event.stopPropagation()">
+            <h3 class="text-xl font-bold text-indigo-700 mb-4">Add New Staff Member</h3>
+            <div class="mb-4">
+                <label for="staff-name-input" class="block text-sm font-medium text-gray-700 mb-1">Staff Full Name</label>
+                <input
+                    id="staff-name-input"
+                    type="text"
+                    placeholder="Enter name (e.g., John Smith)"
+                    class="w-full p-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
+                />
+            </div>
+            <div class="flex justify-end space-x-3">
+                <button
+                    onclick="closeAddStaffModal()"
+                    class="px-4 py-2 text-sm font-semibold text-gray-600 bg-gray-200 rounded-xl hover:bg-gray-300 transition"
+                >
+                    Cancel
+                </button>
+                <button
+                    onclick="addNewStaff()"
+                    id="add-staff-submit-btn"
+                    class="px-4 py-2 text-sm font-semibold text-white rounded-xl transition bg-indigo-600 hover:bg-indigo-700"
+                >
+                    Add Staff
+                </button>
+            </div>
+        </div>
+    </div>
+
+
+    <!-- Load Firebase -->
+    <!-- To enable Firestore and Auth, create a firebase-config.js file that sets window.__firebase_config to your Firebase config object. See firebase-config.example.js -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, updateDoc, deleteDoc, onSnapshot, collection, query, addDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global module imports for access in the main script block
+        window.firebase = {
+            initializeApp, getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, 
+            getFirestore, doc, setDoc, updateDoc, deleteDoc, onSnapshot, collection, query, addDoc
+        };
+    </script>
+
+    <script>
+        // --- GLOBAL STATE & FIREBASE VARS ---
+        let app;
+        let db;
+        let auth;
+        let userId = null;
+        let isAuthReady = false;
+        let staffCollectionRef;
+        let settingsDocRef;
+        let firestoreError = null;
+
+        // Mandatorty globals injected by environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+
+        // --- SCHEDULING CONSTANTS ---
+        const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+        const HOURS = Array.from({ length: 18 }, (_, i) => i + 3); // 3 (03:00) to 20 (20:00)
+        const MIN_START_HOUR = 3;
+        const MAX_END_HOUR = 20;
+        const SHIFT_MIN = 4;
+        const SHIFT_MAX = 8;
+        const BUDGET_BUFFER = 0.03;
+        
+        const defaultExclusions = DAYS.reduce((acc, day) => ({ ...acc, [day]: false }), {});
+
+        // --- APPLICATION STATE ---
+        let staff = [];
+        let coverage = { '03-06': 2, '06-11': 3, '11-15': 2, '15-20': 2 };
+        let weeklyBudget = 275;
+        let schedule = null;
+        let generatedShifts = [];
+        let constraintsMet = null;
+        let isGenerating = false;
+
+        const INITIAL_STAFF = [
+            { id: 1, name: "Gillian", maxHours: 14, maxDays: 7, maxTime: 10, minTime: 3, timePref: 'early', notes: "Must end by 10:00", isHoliday: false, excludedDays: { ...defaultExclusions } },
+            { id: 2, name: "Caleen", maxHours: 12, maxDays: 7, maxTime: 10, minTime: 3, timePref: 'early', notes: "Must end by 10:00", isHoliday: false, excludedDays: { ...defaultExclusions } },
+            { id: 3, name: "Victoria", maxHours: 37.5, maxDays: 5, maxTime: 11, minTime: 3, timePref: 'early', notes: "Must end by 11:00", isHoliday: false, excludedDays: { ...defaultExclusions, 'Sun': true } },
+            { id: 4, name: "Lea", maxHours: 30, maxDays: 4, maxTime: 11, minTime: 3, timePref: 'early', notes: "Must end by 11:00", isHoliday: false, excludedDays: { ...defaultExclusions, 'Sat': true, 'Sun': true } },
+            { id: 5, name: "Sienna", maxHours: 15, maxDays: 7, maxTime: 20, minTime: 6, timePref: 'mid', notes: "", isHoliday: false, excludedDays: { ...defaultExclusions } },
+            { id: 6, name: "Freija", maxHours: 8, maxDays: 7, maxTime: 20, minTime: 6, timePref: 'mid', notes: "", isHoliday: true, excludedDays: { ...defaultExclusions } },
+            { id: 7, name: "Donnay", maxHours: 26.5, maxDays: 5, maxTime: 11, minTime: 3, timePref: 'early', notes: "Must end by 11:00", isHoliday: false, excludedDays: { ...defaultExclusions } },
+            { id: 8, name: "Lola", maxHours: 11, maxDays: 7, maxTime: 20, minTime: 12, timePref: 'late', notes: "MUST be supervised (cannot work alone)", isHoliday: false, excludedDays: { ...defaultExclusions, 'Mon': true } },
+            { id: 9, name: "Marie", maxHours: 22, maxDays: 4, maxTime: 20, minTime: 15, timePref: 'late', notes: "Evening preference (15:00-20:00)", isHoliday: false, excludedDays: { ...defaultExclusions } },
+        ];
+        
+        // --- UTILITY FUNCTIONS ---
+        const calculateRequiredWeeklyHours = (cov) => {
+            const hoursPerDay = (cov['03-06'] * 3) +
+                (cov['06-11'] * 5) +
+                (cov['11-15'] * 4) +
+                (cov['15-20'] * 5);
+            return hoursPerDay * 7;
+        };
+
+        const formatHour = (h) => `${h.toString().padStart(2, '0')}:00`;
+
+        const renderIcon = (name, className) => {
+            return `<i data-lucide="${name}" class="${className}" style="display:inline-block;"></i>`;
+        };
+
+        const renderComplianceIcon = (isOk) => {
+            const iconName = isOk ? 'check-circle' : 'x-circle';
+            const colorClass = isOk ? 'text-green-500' : 'text-red-500';
+            return renderIcon(iconName, `${colorClass} w-4 h-4 mr-1`);
+        };
+        
+        const getEffectiveBudget = () => weeklyBudget * (1 + BUDGET_BUFFER);
+
+        // --- CORE OPTIMIZATION LOGIC ---
+        const checkLolaSupervision = (lolaId, grid) => {
+            let isSupervised = true;
+            DAYS.forEach((day, dIdx) => {
+                HOURS.forEach((hour, hIdx) => {
+                    const staffAtHour = grid[dIdx][hIdx];
+                    if (staffAtHour.includes(lolaId) && staffAtHour.length === 1) {
+                        isSupervised = false;
+                    }
+                });
+            });
+            return isSupervised;
+        };
+
+        const checkCoverage = (grid, reqs) => {
+            const compliance = { hoursMissed: 0, criticalMissed: 0, details: [] };
+
+            DAYS.forEach((day, dIdx) => {
+                HOURS.forEach((hour, hIdx) => {
+                    const staffCount = grid[dIdx][hIdx].length;
+                    let required = 0;
+                    let isCritical = false;
+
+                    if (hour >= 3 && hour < 6) { required = reqs['03-06']; isCritical = true; }
+                    else if (hour >= 6 && hour < 11) { required = reqs['06-11']; }
+                    else if (hour >= 11 && hour < 15) { required = reqs['11-15']; }
+                    else if (hour >= 15 && hour < 20) { required = reqs['15-20']; }
+
+                    if (staffCount < required) {
+                        compliance.hoursMissed++;
+                        if (isCritical) compliance.criticalMissed++;
+                        compliance.details.push({ day: DAYS[dIdx], hour, required, actual: staffCount, critical: isCritical });
+                    }
+                });
+            });
+
+            return compliance;
+        };
+        
+        async function optimizeSchedule() {
+            if (isGenerating || staff.filter(s => !s.isHoliday).length === 0) return;
+            isGenerating = true;
+            renderApp(); // Show loading state
+
+            const activeStaff = staff.filter(s => !s.isHoliday);
+            const lolaId = staff.find(s => s.name === 'Lola')?.id;
+            const effectiveBudget = getEffectiveBudget();
+            const minimumRequiredWeeklyHours = calculateRequiredWeeklyHours(coverage);
+
+            // Asynchronous simulation using setTimeout
+            setTimeout(() => {
+                let staffHours = activeStaff.reduce((acc, s) => ({ ...acc, [s.id]: 0 }), {});
+                let staffDays = activeStaff.reduce((acc, s) => ({ ...acc, [s.id]: 0 }), {});
+                let currentAssignedHours = 0;
+                let calculatedShifts = [];
+
+                // Initialize coverage grid (what is still needed)
+                let coverageGrid = DAYS.map(() => HOURS.map((hour) => {
+                    let required = 0;
+                    if (hour >= 3 && hour < 6) { required = coverage['03-06']; }
+                    else if (hour >= 6 && hour < 11) { required = coverage['06-11']; }
+                    else if (hour >= 11 && hour < 15) { required = coverage['11-15']; }
+                    else if (hour >= 15 && hour < 20) { required = coverage['15-20']; }
+                    return required;
+                }));
+
+                // --- Iterative Shift Selection Loop ---
+                let iterationCount = 0;
+                const MAX_ITERATIONS = 5000;
+
+                while (iterationCount < MAX_ITERATIONS) {
+                    iterationCount++;
+                    let allCandidates = [];
+                    let remainingRequiredCoverage = coverageGrid.flat().reduce((sum, needed) => sum + needed, 0);
+
+                    // Stop conditions
+                    if (remainingRequiredCoverage === 0 && currentAssignedHours > effectiveBudget * 0.95) break;
+                    if (iterationCount > MAX_ITERATIONS * 0.9) break;
+
+                    // --- Generate All Valid Candidate Shifts ---
+                    DAYS.forEach((dayName, dIdx) => {
+                        for (let start = MIN_START_HOUR; start <= MAX_END_HOUR - SHIFT_MIN; start++) {
+                            for (let duration = SHIFT_MIN; duration <= SHIFT_MAX; duration++) {
+                                const end = start + duration;
+                                if (end > MAX_END_HOUR) continue;
+
+                                activeStaff.forEach(s => {
+                                    const staffId = s.id;
+                                    const capacity = s.maxHours;
+
+                                    // 1. Check Daily Exclusion Constraint
+                                    if (s.excludedDays?.[dayName]) return;
+
+                                    // 2. Check Capacity/Budget Constraints
+                                    if (currentAssignedHours + duration > effectiveBudget) return;
+                                    if (staffHours[staffId] + duration > capacity) return;
+
+                                    // Check if staff is already working this day
+                                    const hasShiftToday = calculatedShifts.some(shift => shift.staffId === staffId && shift.day === dayName);
+                                    if (hasShiftToday) return;
+                                    if (staffDays[staffId] >= s.maxDays) return;
+
+                                    // 3. Check Staff Time Constraints
+                                    if (s.minTime > start) return;
+                                    if (s.maxTime < end) return;
+
+                                    // 4. Check Lola's constraint
+                                    if (s.name === 'Lola') {
+                                        let isLolaSupervised = true;
+                                        for (let h = start; h < end; h++) {
+                                            const baseRequired = (h >= 3 && h < 6) ? coverage['03-06'] : (h >= 6 && h < 11) ? coverage['06-11'] : (h >= 11 && h < 15) ? coverage['11-15'] : (h >= 15 && h < 20) ? coverage['15-20'] : 0;
+                                            if (baseRequired <= 1) {
+                                                isLolaSupervised = false;
+                                                break;
+                                            }
+                                        }
+                                        if (!isLolaSupervised) return;
+                                    }
+
+                                    // 5. Score the Shift based on coverage need
+                                    let coverageScore = 0;
+                                    let criticalCoverageScore = 0;
+                                    let slotsGained = 0;
+
+                                    for (let h = start; h < end; h++) {
+                                        const hIdx = h - MIN_START_HOUR;
+                                        const needed = coverageGrid[dIdx][hIdx];
+
+                                        if (needed > 0) {
+                                            coverageScore += 1;
+                                            slotsGained++;
+                                            if (h >= 3 && h < 6) { criticalCoverageScore += 2; }
+                                        }
+                                    }
+
+                                    if (remainingRequiredCoverage === 0 && slotsGained === 0) {
+                                        if (currentAssignedHours + duration > effectiveBudget) return;
+                                        coverageScore = 0.1;
+                                    } else if (slotsGained === 0) {
+                                        return;
+                                    }
+
+                                    // 6. Score the Shift based on Staff Preference/Utilization
+                                    const utilizationPenalty = (staffHours[staffId] + duration) / capacity;
+
+                                    let preferenceBonus = 0;
+                                    if (end <= 11 && s.timePref === 'early') preferenceBonus += 5;
+                                    if (start >= 15 && s.timePref === 'late') preferenceBonus += 5;
+                                    if (s.timePref === 'early' && start >= 11) preferenceBonus -= 3;
+                                    if (s.timePref === 'late' && end <= 11) preferenceBonus -= 3;
+
+                                    let finalScore = (criticalCoverageScore * 100) + (coverageScore * 50) + preferenceBonus - (utilizationPenalty * 30);
+
+                                    if (finalScore < 0 && currentAssignedHours > minimumRequiredWeeklyHours) return;
+
+                                    allCandidates.push({
+                                        staffId: staffId,
+                                        day: dIdx,
+                                        start: start,
+                                        end: end,
+                                        duration: duration,
+                                        score: finalScore,
+                                        slotsGained,
+                                    });
+                                });
+                            }
+                        }
+                    });
+
+                    // --- Select the Best Shift ---
+                    if (allCandidates.length === 0) break;
+                    allCandidates.sort((a, b) => b.score - a.score);
+                    const bestShift = allCandidates[0];
+
+                    if (bestShift.slotsGained === 0 && remainingRequiredCoverage === 0) {
+                        if (currentAssignedHours > effectiveBudget * 0.95) break;
+                    }
+
+                    // Commit the Shift
+                    calculatedShifts.push({
+                        staffId: bestShift.staffId,
+                        day: DAYS[bestShift.day],
+                        start: bestShift.start,
+                        end: bestShift.end,
+                        duration: bestShift.duration,
+                    });
+
+                    // Update capacity trackers
+                    staffHours[bestShift.staffId] += bestShift.duration;
+                    currentAssignedHours += bestShift.duration;
+
+                    // Update assigned days
+                    const isNewDayForStaff = calculatedShifts.filter(shift => shift.staffId === bestShift.staffId && shift.day === DAYS[bestShift.day]).length === 1;
+                    if (isNewDayForStaff) {
+                        staffDays[bestShift.staffId] += 1;
+                    }
+
+                    // Update coverage grid
+                    for (let h = bestShift.start; h < bestShift.end; h++) {
+                        const hIdx = h - MIN_START_HOUR;
+                        coverageGrid[bestShift.day][hIdx] = Math.max(0, coverageGrid[bestShift.day][hIdx] - 1);
+                    }
+                }
+                // --- END Iterative Shift Selection Loop ---
+
+                // Step 3: Format the output schedule and run final checks
+                let formattedSchedule = {};
+                DAYS.forEach(day => {
+                    formattedSchedule[day] = calculatedShifts
+                        .filter(shift => shift.day === day)
+                        .map(shift => ({
+                            staffId: shift.staffId,
+                            name: staff.find(s => s.id === shift.staffId)?.name || 'Unknown',
+                            start: shift.start,
+                            end: shift.end,
+                            duration: shift.duration
+                        }))
+                        .sort((a, b) => a.start - b.start);
+                });
+
+                // Calculate final hourly coverage grid for the compliance check
+                const finalHourGrid = DAYS.map(() => HOURS.map(() => []));
+                calculatedShifts.forEach(shift => {
+                    const dIdx = DAYS.indexOf(shift.day);
+                    for (let h = shift.start; h < shift.end; h++) {
+                        const hIdx = h - MIN_START_HOUR;
+                        if (hIdx >= 0 && hIdx < HOURS.length) {
+                            finalHourGrid[dIdx][hIdx].push(shift.staffId);
+                        }
+                    }
+                });
+
+                const finalReport = {
+                    totalHours: currentAssignedHours,
+                    budgetExceeded: currentAssignedHours > effectiveBudget,
+                    staffCompliance: staff.map(s => {
+                        const assignedHours = staffHours[s.id] || 0;
+                        const assignedDays = staffDays[s.id] || 0;
+
+                        return {
+                            id: s.id,
+                            name: s.name,
+                            isHoliday: s.isHoliday,
+                            maxHours: s.maxHours,
+                            totalCapacity: s.maxHours,
+                            assignedHours: assignedHours,
+                            hoursOk: s.isHoliday || assignedHours <= s.maxHours,
+                            maxDays: s.maxDays,
+                            assignedDays: assignedDays,
+                            daysOk: s.isHoliday || assignedDays <= s.maxDays,
+                            supervisionOk: s.name === 'Lola' ? checkLolaSupervision(lolaId, finalHourGrid) : true,
+                        };
+                    }),
+                    coverageCompliance: checkCoverage(finalHourGrid, coverage),
+                };
+
+                // Update state
+                schedule = formattedSchedule;
+                generatedShifts = calculatedShifts;
+                constraintsMet = finalReport;
+                isGenerating = false;
+                renderApp();
+
+            }, 50);
+        }
+
+        // --- FIREBASE / STATE MUTATORS ---
+
+        async function updateSettings(key, value) {
+            if (firestoreError) {
+                if (key === 'coverage') coverage = value;
+                if (key === 'weeklyBudget') weeklyBudget = value;
+                optimizeSchedule();
+                return;
+            }
+            try {
+                await firebase.setDoc(settingsDocRef, { [key]: value }, { merge: true });
+            } catch (e) {
+                console.error("Error updating settings:", e);
+            }
+        }
+        
+        async function updateStaffConstraint(id, key, value) {
+            const staffToUpdate = staff.find(s => s.id === id);
+            if (!staffToUpdate) return;
+
+            // Handle nested excludedDays update
+            if (key.startsWith('excludedDays_')) {
+                const day = key.split('_')[1];
+                const newExcludedDays = { ...staffToUpdate.excludedDays, [day]: value };
+                
+                // Optimistic local update
+                staff = staff.map(s => (s.id === id ? { ...s, excludedDays: newExcludedDays } : s));
+                optimizeSchedule();
+
+                if (firestoreError) return;
+                try {
+                    const staffDocRef = firebase.doc(db, 'artifacts', appId, 'users', userId, 'staff', staffToUpdate.docId);
+                    await firebase.updateDoc(staffDocRef, { excludedDays: newExcludedDays });
+                } catch (e) {
+                    console.error("Error updating excluded days:", e);
+                }
+                return;
+            }
+
+            // Handle simple key update (e.g., name, maxHours)
+            // Optimistic local update
+            staff = staff.map(s => (s.id === id ? { ...s, [key]: value } : s));
+            optimizeSchedule();
+            
+            if (firestoreError) return; 
+            try {
+                const staffDocRef = firebase.doc(db, 'artifacts', appId, 'users', userId, 'staff', staffToUpdate.docId);
+                await firebase.updateDoc(staffDocRef, { [key]: value });
+            } catch (e) {
+                console.error("Error updating staff constraint:", e);
+            }
+        }
+        
+        async function addNewStaff() {
+            const nameInput = document.getElementById('staff-name-input');
+            const newStaffName = nameInput.value.trim();
+            if (!newStaffName) return;
+
+            const newId = staff.length > 0 ? Math.max(...staff.map(s => s.id)) + 1 : 1;
+            const newStaffMember = {
+                id: newId,
+                name: newStaffName,
+                maxHours: 20,
+                maxDays: 4,
+                maxTime: 18,
+                minTime: 6,
+                timePref: 'mid',
+                notes: "New staff member - edit constraints above.",
+                isHoliday: false,
+                excludedDays: { ...defaultExclusions },
+            };
+
+            if (firestoreError) {
+                staff = [...staff, { ...newStaffMember, docId: `local-${newId}` }];
+                closeAddStaffModal();
+                optimizeSchedule();
+                return;
+            }
+
+            try {
+                await firebase.addDoc(staffCollectionRef, newStaffMember);
+                closeAddStaffModal();
+            } catch (e) {
+                console.error("Error adding new staff:", e);
+            }
+        }
+        
+        async function removeStaff(id) {
+            const staffToRemove = staff.find(s => s.id === id);
+            if (!staffToRemove) return;
+
+            if (firestoreError) {
+                staff = staff.filter(s => s.id !== id);
+                optimizeSchedule();
+                return;
+            }
+
+            try {
+                const staffDocRef = firebase.doc(db, 'artifacts', appId, 'users', userId, 'staff', staffToRemove.docId);
+                await firebase.deleteDoc(staffDocRef);
+            } catch (e) {
+                console.error("Error removing staff:", e);
+            }
+        }
+
+        // --- MODAL FUNCTIONS ---
+        function openAddStaffModal() {
+            document.getElementById('add-staff-modal').classList.remove('hidden');
+            document.getElementById('staff-name-input').focus();
+        }
+
+        function closeAddStaffModal() {
+            document.getElementById('add-staff-modal').classList.add('hidden');
+            document.getElementById('staff-name-input').value = '';
+        }
+
+        // --- DOM RENDER FUNCTIONS ---
+        
+        // This is a complex component, rendered via template literal
+        function renderStaffConstraintItem(s) {
+            const compliance = constraintsMet?.staffCompliance.find(c => c.id === s.id);
+            const isLola = s.name === 'Lola';
+            const hoursClass = s.isHoliday ? 'text-gray-500' : (compliance?.hoursOk ? 'text-green-700' : 'text-red-700');
+            const daysClass = s.isHoliday ? 'text-gray-500' : (compliance?.daysOk ? 'text-green-700' : 'text-red-700');
+            const superViseClass = s.isHoliday ? 'text-gray-500' : (compliance?.supervisionOk ? 'text-green-700' : 'text-red-700');
+            const disabledAttr = s.isHoliday ? 'disabled' : '';
+            const bgClass = s.isHoliday ? 'bg-red-100/50' : 'bg-gray-100';
+
+            const exclusionCheckboxes = DAYS.map(day => `
+                <div class="flex flex-col items-center">
+                    <span class="text-sm font-bold text-gray-600 mb-1">${day}</span>
+                    <input
+                        type="checkbox"
+                        onchange="updateStaffConstraint(${s.id}, 'excludedDays_${day}', this.checked)"
+                        ${s.excludedDays?.[day] ? 'checked' : ''}
+                        class="h-5 w-5 text-red-600 border-gray-300 rounded focus:ring-red-500 disabled:opacity-50"
+                        ${disabledAttr}
+                    />
+                </div>
+            `).join('');
+
+            const timePrefOptions = ['early', 'mid', 'late'].map(pref => `
+                <option value="${pref}" ${s.timePref === pref ? 'selected' : ''}>${pref.charAt(0).toUpperCase() + pref.slice(1)}</option>
+            `).join('');
+
+
+            const complianceStatus = compliance && !s.isHoliday ? `
+                <div class="mt-3 pt-3 border-t border-gray-200">
+                    <p class="text-sm font-bold text-indigo-700 flex justify-between">
+                        <span>Assigned: <span class="${hoursClass}">${compliance.assignedHours.toFixed(1)}h</span> / <span class="font-medium">${compliance.maxHours.toFixed(1)}h</span> </span>
+                        <span>Days: <span class="${daysClass}">${compliance.assignedDays}</span> / <span class="font-medium">${compliance.maxDays}</span></span>
+                    </p>
+                    ${isLola ? `
+                        <p class="text-sm font-bold ${superViseClass} mt-1">
+                            ${compliance.supervisionOk ? 'Lola is supervised.' : '⚠️ LOLA UNSUPERVISED!'}
+                        </p>
+                    ` : ''}
+                </div>
+            ` : '';
+
+            return `
+                <div class="p-4 rounded-xl border border-gray-200 transition-all ${bgClass}">
+                    <div class="flex justify-between items-start mb-3">
+                        <input
+                            type="text"
+                            value="${s.name}"
+                            onchange="updateStaffConstraint(${s.id}, 'name', this.value)"
+                            class="p-2 border rounded-lg text-base font-bold flex-grow mr-4 focus:ring-indigo-500 focus:border-indigo-500 transition ${s.isHoliday ? 'bg-red-100 border-red-300 text-gray-500 line-through' : 'bg-white border-gray-300 text-indigo-900'}"
+                            ${disabledAttr}
+                        />
+
+                        <div class="flex items-center space-x-3">
+                            <div class="flex items-center space-x-1">
+                                <label class="text-sm font-semibold text-red-600 flex items-center whitespace-nowrap">Holiday</label>
+                                <input
+                                    type="checkbox"
+                                    ${s.isHoliday ? 'checked' : ''}
+                                    onchange="updateStaffConstraint(${s.id}, 'isHoliday', this.checked)"
+                                    class="h-5 w-5 text-red-600 border-gray-300 rounded focus:ring-red-500"
+                                />
+                            </div>
+
+                            <button
+                                onclick="removeStaff(${s.id})"
+                                class="text-red-500 hover:text-red-700 p-1.5 rounded-full hover:bg-red-200 transition flex-shrink-0"
+                                title="Remove ${s.name}"
+                            >
+                                ${renderIcon('minus-circle', 'w-5 h-5')}
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="grid grid-cols-5 gap-3 text-sm">
+                        <div class="col-span-1">
+                            <label class="text-gray-500 block text-xs font-medium">Min Start</label>
+                            <input
+                                type="number" min="3" max="19"
+                                value="${s.minTime}"
+                                onchange="updateStaffConstraint(${s.id}, 'minTime', parseInt(this.value) || 0)"
+                                class="w-full p-2 border rounded-lg text-center focus:ring-indigo-500 focus:border-indigo-500 ${s.isHoliday ? 'bg-red-100 border-red-300 text-gray-500' : 'bg-white border-gray-300'}"
+                                ${disabledAttr}
+                            />
+                        </div>
+                        <div class="col-span-1">
+                            <label class="text-gray-500 block text-xs font-medium">Max End</label>
+                            <input
+                                type="number" min="4" max="20"
+                                value="${s.maxTime}"
+                                onchange="updateStaffConstraint(${s.id}, 'maxTime', parseInt(this.value) || 0)"
+                                class="w-full p-2 border rounded-lg text-center focus:ring-indigo-500 focus:border-indigo-500 ${s.isHoliday ? 'bg-red-100 border-red-300 text-gray-500' : 'bg-white border-gray-300'}"
+                                ${disabledAttr}
+                            />
+                        </div>
+                        <div class="col-span-1">
+                            <label class="text-gray-500 block text-xs font-medium">Max Hrs</label>
+                            <input
+                                type="number" min="0" step="0.5"
+                                value="${s.maxHours}"
+                                onchange="updateStaffConstraint(${s.id}, 'maxHours', parseFloat(this.value) || 0)"
+                                class="w-full p-2 border rounded-lg text-center focus:ring-indigo-500 focus:border-indigo-500 ${s.isHoliday ? 'bg-red-100 border-red-300 text-gray-500' : 'bg-white border-gray-300'}"
+                                ${disabledAttr}
+                            />
+                        </div>
+                        <div class="col-span-1">
+                            <label class="text-gray-500 block text-xs font-medium">Max Days</label>
+                            <input
+                                type="number" min="0" max="7"
+                                value="${s.maxDays}"
+                                onchange="updateStaffConstraint(${s.id}, 'maxDays', parseInt(this.value) || 0)"
+                                class="w-full p-2 border rounded-lg text-center focus:ring-indigo-500 focus:border-indigo-500 ${s.isHoliday ? 'bg-red-100 border-red-300 text-gray-500' : 'bg-white border-gray-300'}"
+                                ${disabledAttr}
+                            />
+                        </div>
+                        <div class="col-span-1">
+                            <label class="text-gray-500 block text-xs font-medium">Pref.</label>
+                            <select
+                                value="${s.timePref}"
+                                onchange="updateStaffConstraint(${s.id}, 'timePref', this.value)"
+                                class="w-full p-2 border rounded-lg text-center focus:ring-indigo-500 focus:border-indigo-500 ${s.isHoliday ? 'bg-red-100 border-red-300 text-gray-500' : 'bg-white border-gray-300'}"
+                                ${disabledAttr}
+                            >
+                                ${timePrefOptions}
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="mt-4 pt-4 border-t border-gray-200">
+                        <label class="text-gray-700 block text-sm font-bold mb-2">Exclude Days (Cannot Work):</label>
+                        <div class="flex justify-between px-1">
+                            ${exclusionCheckboxes}
+                        </div>
+                    </div>
+                    
+                    <input 
+                        type="text"
+                        value="${s.notes}"
+                        onchange="updateStaffConstraint(${s.id}, 'notes', this.value)"
+                        placeholder="Enter notes/specific requirements (e.g., must end by 10:00)"
+                        class="w-full p-2 mt-3 border border-gray-300 rounded-lg text-sm text-gray-700 focus:ring-indigo-500 focus:border-indigo-500"
+                        ${disabledAttr}
+                    />
+                    
+                    ${complianceStatus}
+                </div>
+            `;
+        }
+
+        function renderStaffConstraints() {
+            const staffItemsHtml = staff.map(renderStaffConstraintItem).join('');
+
+            return `
+                <div class="lg:col-span-3 bg-white p-6 rounded-xl shadow-xl h-full flex flex-col">
+                    <div class="flex justify-between items-center mb-4 border-b pb-2">
+                        <h2 class="text-xl font-bold text-indigo-700 flex items-center">
+                            ${renderIcon('user', 'mr-2 w-5 h-5')} Staff Constraints
+                        </h2>
+                        <button
+                            onclick="openAddStaffModal()"
+                            class="flex items-center text-sm px-3 py-1 bg-indigo-100 text-indigo-600 font-semibold rounded-lg hover:bg-indigo-200 transition"
+                        >
+                            ${renderIcon('plus', 'w-4 h-4 mr-1')} Add New Staff
+                        </button>
+                    </div>
+
+                    <div class="space-y-3 max-h-[400px] overflow-y-auto pr-2">
+                        ${staffItemsHtml}
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderCoverageCard() {
+            const requiredWeeklyHours = calculateRequiredWeeklyHours(coverage);
+            const coverageInputsHtml = Object.entries(coverage).map(([range, count]) => `
+                <div class="flex justify-between items-center">
+                    <label class="text-sm font-medium text-gray-700 w-40 flex-shrink-0">
+                        ${formatHour(parseInt(range.split('-')[0]))} - ${formatHour(parseInt(range.split('-')[1]))}
+                    </label>
+                    <input
+                        type="number"
+                        min="0" max="5"
+                        value="${count}"
+                        onchange="updateSettings('coverage', { ...coverage, '${range}': parseInt(this.value) || 0 })"
+                        class="w-16 p-2 border border-gray-300 rounded-md text-center text-sm focus:ring-indigo-500 focus:border-indigo-500"
+                    />
+                    ${range === '03-06' ? '<span class="text-red-500 text-xs font-semibold w-20 text-right">CRITICAL</span>' : '<span class="w-20"></span>'}
+                </div>
+            `).join('');
+            
+            return `
+                <div class="bg-white p-6 rounded-xl shadow-xl h-full">
+                    <h2 class="text-xl font-bold text-indigo-700 mb-4 flex items-center">
+                        ${renderIcon('calendar', 'mr-2 w-5 h-5')} Minimum Coverage Required
+                    </h2>
+                    <p class="text-sm text-gray-600 mb-3">Adjust the <b>minimum</b> staff needed for each time block (Sun - Sat).</p>
+                    <div class="space-y-3">
+                        ${coverageInputsHtml}
+                    </div>
+
+                    <div class="mt-6 pt-4 border-t border-gray-200">
+                        <p class="text-sm font-bold text-gray-700">Minimum Required Weekly Hours:</p>
+                        <p class="text-xl font-extrabold text-indigo-800">${requiredWeeklyHours.toFixed(1)}h</p>
+                        <p class="text-xs text-gray-500 mt-1">This is the absolute minimum staff hours needed to meet the coverage above.</p>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderOptimizationCard() {
+            const budgetExceeded = constraintsMet?.budgetExceeded || false;
+            const totalHours = constraintsMet?.totalHours.toFixed(1) || '0.0';
+            const hoursMissed = constraintsMet?.coverageCompliance?.hoursMissed || 0;
+            const criticalMissed = constraintsMet?.coverageCompliance?.criticalMissed || 0;
+            const calculateEffectiveBudget = getEffectiveBudget();
+
+            const budgetStatusText = budgetExceeded
+                ? `Effective Budget Exceeded by ${(constraintsMet.totalHours - calculateEffectiveBudget).toFixed(1)}h!`
+                : 'Effective Budget Compliant.';
+
+            const staffComplianceHtml = constraintsMet?.staffCompliance.map(s => {
+                if (s.isHoliday) return '';
+                if (!s.hoursOk || !s.daysOk || !s.supervisionOk) {
+                    return `
+                        <div class="flex items-center text-xs text-gray-700 font-bold">
+                            ${renderComplianceIcon(false)}
+                            <span class="ml-1">${s.name}:
+                                ${!s.hoursOk ? `<span class="text-red-600 ml-1"> (Capacity Exceeded: ${s.assignedHours.toFixed(1)}/${s.totalCapacity.toFixed(1)})</span>` : ''}
+                                ${!s.daysOk ? `<span class="text-red-600 ml-1"> (Max Days Exceeded: ${s.assignedDays}/${s.maxDays})</span>` : ''}
+                                ${!s.supervisionOk && s.name === 'Lola' ? `<span class="text-red-600 ml-1"> (Lola Unsupervised!)</span>` : ''}
+                            </span>
+                        </div>
+                    `;
+                }
+                return '';
+            }).join('');
+            
+            const allActiveStaffOk = constraintsMet && staffComplianceHtml.trim() === '';
+
+            return `
+                <div class="bg-indigo-50 p-6 rounded-xl shadow-xl flex flex-col justify-between">
+                    <h2 class="text-xl font-bold text-indigo-700 mb-4 flex items-center">
+                        ${renderIcon('maximize-2', 'mr-2 w-5 h-5')} Optimization & Budget
+                    </h2>
+
+                    <div class="mb-4">
+                        <label class="text-sm font-semibold text-gray-700 block mb-1">Target Weekly Staff Hours Budget (W/O Buffer)</label>
+                        <input
+                            type="number"
+                            min="${calculateRequiredWeeklyHours(coverage).toFixed(1)}"
+                            value="${weeklyBudget}"
+                            onchange="updateSettings('weeklyBudget', parseFloat(this.value) || 0)"
+                            class="w-full p-2 border border-indigo-300 rounded-md text-center text-lg font-bold focus:ring-indigo-500 focus:border-indigo-500"
+                        />
+                        <p class="text-xs text-gray-500 mt-1">The user-defined base budget.</p>
+                    </div>
+
+                    <div class="mb-4 p-3 bg-indigo-100 rounded-lg border border-indigo-200">
+                        <p class="text-sm font-semibold text-gray-700 flex justify-between">
+                            <span>Base Budget:</span>
+                            <span class="font-extrabold text-gray-800">${weeklyBudget.toFixed(1)}h</span>
+                        </p>
+                        <p class="text-sm font-semibold text-gray-700 flex justify-between">
+                            <span>${(BUDGET_BUFFER * 100).toFixed(0)}% Buffer:</span>
+                            <span class="font-extrabold text-green-700"> +${((calculateEffectiveBudget - weeklyBudget) || 0).toFixed(1)}h</span>
+                        </p>
+                        <div class="border-t border-indigo-300 mt-1 pt-1 flex justify-between">
+                            <p class="font-bold text-lg text-indigo-800">Effective Budget Cap:</p>
+                            <p class="font-extrabold text-lg text-indigo-800">${calculateEffectiveBudget.toFixed(1)}h</p>
+                        </div>
+                        <p class="text-xs text-gray-500 mt-1">The generator will cap assigned hours at this *effective* amount.</p>
+                    </div>
+
+                    ${constraintsMet ? `
+                        <div class="mb-4 space-y-2">
+                            <p class="text-gray-700 font-semibold border-b border-indigo-200 pb-2">
+                                Total Assigned Hours:
+                                <span class="text-2xl font-extrabold ml-2 ${budgetExceeded ? 'text-red-700' : 'text-indigo-800'}">
+                                    ${totalHours}h
+                                </span>
+                            </p>
+
+                            <div class="flex items-center text-sm">
+                                ${renderComplianceIcon(!budgetExceeded)}
+                                <span class="ml-2 ${budgetExceeded ? 'text-red-600 font-bold' : 'text-green-700'}">
+                                    ${budgetStatusText}
+                                </span>
+                            </div>
+
+                            <div class="pt-2 border-t border-indigo-200">
+                                <p class="font-semibold text-sm mb-1">Coverage Status:</p>
+                                <div class="flex items-center text-sm">
+                                    ${renderComplianceIcon(hoursMissed === 0)}
+                                    <span class="ml-2 ${hoursMissed > 0 ? 'text-red-600 font-bold' : 'text-green-700'}">
+                                        ${hoursMissed} hour(s) missed minimum required coverage.
+                                    </span>
+                                </div>
+                                ${criticalMissed > 0 ? '<p class="text-xs text-red-500 mt-1 ml-4 font-semibold">(' + criticalMissed + ' critical hours missed!)</p>' : ''}
+                            </div>
+
+                            <div class="pt-2 border-t border-indigo-200">
+                                <p class="font-semibold text-sm mb-1">Staff Constraint Checks:</p>
+                                ${staffComplianceHtml || `<div class="flex items-center text-sm text-green-700">${renderIcon('check-circle', 'mr-1 w-4 h-4')} All active staff constraints met.</div>`}
+                            </div>
+                        </div>
+                    ` : ''}
+
+                    <button
+                        onclick="optimizeSchedule()"
+                        ${isGenerating ? 'disabled' : ''}
+                        class="w-full py-3 px-4 rounded-xl text-white font-bold transition duration-300 shadow-lg ${
+                            isGenerating ? 'bg-indigo-400 cursor-not-allowed' : 'bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800'
+                        } flex items-center justify-center"
+                    >
+                        ${renderIcon('refresh-cw', `mr-2 w-4 h-4 ${isGenerating ? 'animate-spin' : ''}`)}
+                        ${isGenerating ? 'Optimizing...' : 'Generate New Schedule'}
+                    </button>
+                </div>
+            `;
+        }
+
+        function renderScheduleTable() {
+            if (!schedule) return '';
+            
+            const shortfallAlert = constraintsMet && constraintsMet.coverageCompliance.hoursMissed > 0 ? `
+                <div class="mt-4 p-3 bg-yellow-100 border border-yellow-400 rounded-lg text-sm text-yellow-800">
+                    <p class="font-semibold">⚠️ Coverage Shortfalls Identified:</p>
+                    <ul class="list-disc ml-4 mt-1 space-y-0.5">
+                        ${constraintsMet.coverageCompliance.details.slice(0, 5).map((detail) => `
+                            <li>
+                                ${detail.day} at ${formatHour(detail.hour)} (${detail.critical ? 'CRITICAL' : 'Regular'}): Needs ${detail.required}, has ${detail.actual}.
+                            </li>
+                        `).join('')}
+                        ${constraintsMet.coverageCompliance.details.length > 5 ? `<li>... and ${constraintsMet.coverageCompliance.details.length - 5} more shortfalls.</li>` : ''}
+                    </ul>
+                    <p class="mt-2 text-xs">To fix this, increase the <b>Target Weekly Staff Hours Budget</b> or adjust individual staff constraints (Max Hours/Days, Min/Max Time window).</p>
+                </div>
+            ` : '';
+
+            const tableRows = staff.map(s => {
+                const compliance = constraintsMet?.staffCompliance.find(c => c.id === s.id);
+                const assignedHours = compliance?.assignedHours || 0;
+                const hoursClass = s.isHoliday ? 'text-gray-500' : (compliance?.hoursOk ? 'text-green-700' : 'text-red-700');
+                const rowClass = s.isHoliday ? 'bg-red-50/50 italic' : '';
+                const stickyColClass = s.isHoliday ? 'text-gray-500 line-through bg-red-50/50 hover:bg-red-50/50' : 'text-gray-900 bg-white hover:bg-gray-50';
+
+                const dayCells = DAYS.map(day => {
+                    const dayShifts = schedule[day]?.filter(shift => shift.staffId === s.id) || [];
+                    const shiftHtml = dayShifts.map((shift, index) => `
+                        <div key="${index}" class="text-xs font-medium text-gray-800 bg-indigo-100 rounded-md px-1 my-0.5">
+                            ${formatHour(shift.start).substring(0, 5)} - ${formatHour(shift.end).substring(0, 5)} <span class="text-indigo-600 font-bold ml-1">(${shift.duration}h)</span>
+                        </div>
+                    `).join('');
+                    
+                    let dayTag = '';
+                    if (s.isHoliday && dayShifts.length === 0) dayTag = '<span class="text-red-400 text-xs">(Hol)</span>';
+                    if (s.excludedDays?.[day] && dayShifts.length === 0) dayTag = '<span class="text-red-500 text-xs font-semibold">(EXCL)</span>';
+                    if (s.excludedDays?.[day] && dayShifts.length > 0) dayTag = '<span class="text-red-700 text-xs font-extrabold">(ERROR: Excluded)</span>';
+
+                    return `<td class="px-3 py-1 whitespace-nowrap text-sm text-gray-500 min-w-[150px]">${shiftHtml}${dayTag}</td>`;
+                }).join('');
+
+                return `
+                    <tr class="${rowClass} hover:bg-gray-50">
+                        <td class="px-3 py-2 whitespace-nowrap text-sm font-medium sticky left-0 z-20 sticky-col ${stickyColClass}">
+                            ${s.name}
+                        </td>
+                        ${dayCells}
+                        <td class="px-3 py-2 whitespace-nowrap text-sm font-bold ${hoursClass}">
+                            ${assignedHours.toFixed(1)}
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+
+            // Coverage Row
+            const coverageCells = DAYS.map(day => {
+                const hourBlocks = HOURS.map((hour) => {
+                    const staffCount = generatedShifts.filter(shift =>
+                        shift.day === day &&
+                        (hour >= shift.start && hour < shift.end)
+                    ).length;
+
+                    let required = 0;
+                    if (hour >= 3 && hour < 6) { required = coverage['03-06']; }
+                    else if (hour >= 6 && hour < 11) { required = coverage['06-11']; }
+                    else if (hour >= 11 && hour < 15) { required = coverage['11-15']; }
+                    else if (hour >= 15 && hour < 20) { required = coverage['15-20']; }
+
+                    const isUnderstaffed = staffCount < required;
+                    const timeLabel = formatHour(hour).substring(0, 5);
+
+                    return `
+                        <span
+                            class="inline-block px-1 rounded-md text-center text-xs ${isUnderstaffed ? 'bg-red-300 text-red-900 font-extrabold' : 'bg-green-200 text-green-800'}"
+                            title="${timeLabel} - Required: ${required}, Actual: ${staffCount}"
+                        >
+                            ${staffCount}/${required}
+                        </span>
+                    `;
+                }).join('');
+
+                return `<td class="px-3 py-1 whitespace-nowrap text-xs text-indigo-900"><div class="flex flex-wrap gap-1">${hourBlocks}</div></td>`;
+            }).join('');
+
+            return `
+                <div class="mt-8 bg-white p-6 rounded-xl shadow-xl overflow-x-auto">
+                    <h2 class="text-2xl font-bold text-indigo-700 mb-4">Generated Weekly Schedule</h2>
+                    <div class="table-container">
+                        <table class="schedule-table divide-y divide-gray-200">
+                            <thead class="sticky top-0 z-10 bg-white">
+                                <tr class="bg-indigo-50">
+                                    <th class="px-3 py-3 text-left text-xs font-medium text-indigo-700 uppercase tracking-wider sticky left-0 z-30 sticky-col border-b border-gray-200">Staff</th>
+                                    ${DAYS.map(day => `<th class="px-3 py-3 text-left text-xs font-medium text-indigo-700 uppercase tracking-wider border-b border-gray-200">${day}</th>`).join('')}
+                                    <th class="px-3 py-3 text-left text-xs font-medium text-indigo-700 uppercase tracking-wider border-b border-gray-200">Total H</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-gray-200">
+                                ${tableRows}
+                                <tr class="bg-indigo-100 border-t-2 border-indigo-300 font-bold">
+                                    <td class="px-3 py-2 whitespace-nowrap text-xs text-indigo-900 sticky left-0 z-20 bg-indigo-100 sticky-col">
+                                        HOURLY COVERAGE (Actual / Min)
+                                    </td>
+                                    ${coverageCells}
+                                    <td></td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    ${shortfallAlert}
+                </div>
+            `;
+        }
+
+        // --- MAIN RENDER LOOP ---
+        function renderApp() {
+            const appDiv = document.getElementById('app');
+            
+            if (!isAuthReady) {
+                appDiv.innerHTML = `
+                    <div class="min-h-screen flex items-center justify-center bg-gray-50">
+                        <div class="text-center p-12">
+                            ${renderIcon('settings', 'animate-spin h-6 w-6 mr-3 text-indigo-600 inline-block')}
+                            <p class="mt-2 text-gray-600">Loading application data...</p>
+                        </div>
+                    </div>
+                `;
+                // Render icons after HTML insertion
+                lucide.createIcons(); 
+                return;
+            }
+
+            const headerHtml = `
+                <h1 class="text-3xl font-extrabold text-indigo-800 mb-2 flex items-center">
+                    ${renderIcon('settings', 'mr-3 w-8 h-8')} Bakery Shift Optimizer
+                </h1>
+                ${firestoreError ? `
+                    <div class="p-3 bg-yellow-100 text-yellow-800 rounded-lg mb-4 border border-yellow-300">
+                        <p class="font-semibold">Data Warning:</p>
+                        <p class="text-sm">${firestoreError} Changes are currently not being saved permanently.</p>
+                    </div>
+                ` : ''}
+                <p class="text-gray-600 mb-6">
+                    Defines staff constraints and coverage requirements to generate a schedule within your budget. <b>All assigned shifts are 4 to 8 hours long.</b>
+                </p>
+            `;
+            
+            // Replicate the 60/40 layout using a 5-column grid on large screens
+            const mainContentHtml = `
+                <div class="grid grid-cols-1 lg:grid-cols-5 gap-6 mb-8">
+                    <!-- Staff Constraints: takes 3 columns (60%) -->
+                    ${renderStaffConstraints()}
+                    
+                    <!-- Coverage & Optimization: takes 2 columns (40%) -->
+                    <div class="lg:col-span-2 grid grid-cols-1 gap-6">
+                        ${renderCoverageCard()}
+                        ${renderOptimizationCard()}
+                    </div>
+                </div>
+                ${schedule ? renderScheduleTable() : ''}
+            `;
+
+            appDiv.innerHTML = headerHtml + mainContentHtml;
+
+            // Render icons after HTML insertion
+            lucide.createIcons();
+            
+            // Adjust modal button state
+            const nameInput = document.getElementById('staff-name-input');
+            if (nameInput) {
+                 nameInput.oninput = () => {
+                    const submitBtn = document.getElementById('add-staff-submit-btn');
+                    if (submitBtn) {
+                        submitBtn.disabled = !nameInput.value.trim();
+                        if (submitBtn.disabled) {
+                            submitBtn.classList.add('bg-indigo-400', 'cursor-not-allowed');
+                            submitBtn.classList.remove('bg-indigo-600', 'hover:bg-indigo-700');
+                        } else {
+                            submitBtn.classList.remove('bg-indigo-400', 'cursor-not-allowed');
+                            submitBtn.classList.add('bg-indigo-600', 'hover:bg-indigo-700');
+                        }
+                    }
+                };
+            }
+        }
+
+
+        // --- INITIALIZATION ---
+        window.onload = function () {
+            // Firebase setup after module imports are ready
+            (async function initializeFirebase() {
+                // Wait for the window.firebase object to be populated by the module script
+                if (typeof window.firebase === 'undefined') {
+                    console.error("Firebase module not loaded.");
+                    setTimeout(initializeFirebase, 100);
+                    return;
+                }
+                
+                try {
+                    // Set up logging (optional but helpful for debugging)
+                    // firebase.setLogLevel('Debug');
+                    
+                    app = firebase.initializeApp(firebaseConfig);
+                    db = firebase.getFirestore(app);
+                    auth = firebase.getAuth(app);
+                    
+                    // 1. Authentication
+                    await new Promise(resolve => {
+                        const unsubscribe = firebase.onAuthStateChanged(auth, async (user) => {
+                            unsubscribe();
+                            if (user) {
+                                userId = user.uid;
+                            } else {
+                                try {
+                                    if (initialAuthToken) {
+                                        await firebase.signInWithCustomToken(auth, initialAuthToken);
+                                        userId = auth.currentUser.uid;
+                                    } else {
+                                        const anonymousUser = await firebase.signInAnonymously(auth);
+                                        userId = anonymousUser.user.uid;
+                                    }
+                                } catch (e) {
+                                    console.error("Auth Error:", e);
+                                    // Fallback to anonymous sign-in if custom token fails
+                                    const anonymousUser = await firebase.signInAnonymously(auth);
+                                    userId = anonymousUser.user.uid;
+                                }
+                            }
+                            
+                            staffCollectionRef = firebase.collection(db, 'artifacts', appId, 'users', userId, 'staff');
+                            settingsDocRef = firebase.doc(db, 'artifacts', appId, 'users', userId, 'settings', 'scheduler');
+                            isAuthReady = true;
+                            resolve();
+                        });
+                    });
+
+                    // 2. Firestore Listeners
+                    // Listen for Staff Changes
+                    firebase.onSnapshot(firebase.query(staffCollectionRef), (snapshot) => {
+                        if (snapshot.empty) {
+                            // Initialize staff if collection is empty
+                            INITIAL_STAFF.forEach(async (s) => {
+                                // Add initial staff using the ID from the mock data
+                                await firebase.addDoc(staffCollectionRef, s);
+                            });
+                        } else {
+                            staff = snapshot.docs.map(d => ({ 
+                                docId: d.id, 
+                                ...d.data(), 
+                                // Ensure excludedDays defaults are applied if missing
+                                excludedDays: {
+                                    ...defaultExclusions,
+                                    ...(d.data().excludedDays || {})
+                                }
+                            }));
+                            optimizeSchedule(); // Re-run optimization on data change
+                        }
+                    }, (error) => {
+                        console.error("Staff Snapshot Error:", error);
+                        firestoreError = "Could not load staff data in real-time. Using local mock data.";
+                        staff = INITIAL_STAFF.map((s, idx) => ({ ...s, docId: `local-${idx}` }));
+                        optimizeSchedule();
+                    });
+
+                    // Listen for Settings Changes (Coverage and Budget)
+                    firebase.onSnapshot(settingsDocRef, (docSnap) => {
+                        if (docSnap.exists()) {
+                            const data = docSnap.data();
+                            coverage = data.coverage || coverage;
+                            weeklyBudget = data.weeklyBudget || weeklyBudget;
+                        } else {
+                            // Initialize settings if document doesn't exist
+                            firebase.setDoc(settingsDocRef, { coverage: coverage, weeklyBudget: weeklyBudget });
+                        }
+                        optimizeSchedule(); // Re-run optimization on settings change
+                    }, (error) => {
+                        console.error("Settings Snapshot Error:", error);
+                        firestoreError = "Could not load settings. Using local mock data.";
+                        optimizeSchedule();
+                    });
+
+                } catch (e) {
+                    console.error("Critical Firebase Initialization Error:", e);
+                    firestoreError = "Error initializing Firebase. Using local mock data.";
+                    isAuthReady = true;
+                    staff = INITIAL_STAFF.map((s, idx) => ({ ...s, docId: `local-${idx}` }));
+                    optimizeSchedule(); // Run initial optimization with mock data
+                }
+            })();
+        };
+        
+    </script>
+</body>
+</html>
+
+
