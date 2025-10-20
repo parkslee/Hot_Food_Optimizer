@@ -107,9 +107,11 @@
         const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? JSON.parse(__initial_auth_token) : null;
 
 
-        // --- SCHEDULING CONSTANTS ---
+        // --- SCHEDULING CONSTANTS (UPDATED FOR HOURLY COVERAGE) ---
         const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-        const HOURS = Array.from({ length: 11 }, (_, i) => i + 7); // 7 (07:00) to 17 (17:00)
+        // HOURS array contains the start hour of each 1-hour block (7:00, 8:00, ..., 16:00).
+        // It covers the period from 07:00 up to (but not including) 17:00.
+        const HOURS = Array.from({ length: 10 }, (_, i) => i + 7); // 7 (07:00) to 16 (16:00)
         const MIN_START_HOUR = 7;
         const MAX_END_HOUR = 17;
         const SHIFT_MIN = 4;
@@ -118,16 +120,16 @@
 
         const defaultExclusions = DAYS.reduce((acc, day) => ({ ...acc, [day]: false }), {});
 
-        // --- APPLICATION STATE ---
+        // --- APPLICATION STATE (UPDATED FOR HOURLY COVERAGE) ---
         let staff = [];
-        let coverage = { '07-11': 1, '11-15': 1, '12-16': 1, '13-17': 1 };
+        // Coverage is now hourly: '7' for 07:00-08:00, '8' for 08:00-09:00, etc.
+        let coverage = HOURS.reduce((acc, h) => ({ ...acc, [h]: 1 }), {});
         let weeklyBudget = 275;
         let schedule = null;
         let generatedShifts = [];
         let constraintsMet = null;
         let isGenerating = false;
 
-        // CRITICAL FIX: Changed maxTime from 10 to 11 for Paul and Francesca.
         const INITIAL_STAFF = [
             { id: 1, name: "Paul", maxHours: 14, maxDays: 7, maxTime: 11, minTime: 3, timePref: 'early', notes: "Must end by 11:00 (Required for 4h shift)", isHoliday: false, excludedDays: { ...defaultExclusions } },
             { id: 2, name: "Francesca", maxHours: 12, maxDays: 7, maxTime: 11, minTime: 3, timePref: 'early', notes: "Must end by 11:00 (Required for 4h shift)", isHoliday: false, excludedDays: { ...defaultExclusions } },
@@ -135,13 +137,10 @@
 
         ];
 
-        // --- UTILITY FUNCTIONS ---
+        // --- UTILITY FUNCTIONS (UPDATED FOR HOURLY COVERAGE) ---
         const calculateRequiredWeeklyHours = (cov) => {
-            const hoursPerDay = (cov['07-11'] * 4) + // 7, 8, 9, 10 = 4 hours
-                (cov['11-15'] * 4) + // 11, 12, 13, 14 = 4 hours
-                (cov['12-16'] * 4) + // 12, 13, 14, 15 = 4 hours
-                (cov['13-17'] * 4); // 13, 14, 15, 16 = 4 hours
-            // NOTE: This calculation is complex due to overlapping intervals and may be slightly inaccurate for strict coverage but serves as a reasonable minimum guide.
+            // Sum of required staff for each hour in a day, multiplied by 7 days.
+            const hoursPerDay = Object.values(cov).reduce((sum, count) => sum + count, 0);
             return hoursPerDay * 7;
         };
 
@@ -159,30 +158,30 @@
 
         const getEffectiveBudget = () => weeklyBudget * (1 + BUDGET_BUFFER);
 
-        // --- CORE OPTIMIZATION LOGIC ---
+        // --- CORE OPTIMIZATION LOGIC (UPDATED FOR HOURLY COVERAGE) ---
+
+        const getRequiredStaffForHour = (hour, reqs) => {
+            // Get required staff count from the new hourly coverage object
+            return reqs[hour] || 0;
+        };
 
         const checkCoverage = (grid, reqs) => {
-            const compliance = { hoursMissed: 0, criticalMissed: 0, details: [] };
+            const compliance = { hoursMissed: 0, details: [] };
 
             DAYS.forEach((day, dIdx) => {
                 HOURS.forEach((hour, hIdx) => {
                     const staffCount = grid[dIdx][hIdx].length;
-                    let required = 0;
-                    let isCritical = false;
-
-                    // Updated to use existing coverage keys
-                    if (hour >= 7 && hour < 11) { required = reqs['07-11']; isCritical = true; }
-                    else if (hour >= 11 && hour < 15) { required = reqs['11-15']; }
-                    else if (hour >= 12 && hour < 16) { required = reqs['12-16']; }
-                    else if (hour >= 13 && hour < 17) { required = reqs['13-17']; }
-
+                    const required = getRequiredStaffForHour(hour, reqs);
+                    // No longer tracking 'critical' hours explicitly here, just missed coverage
                     if (staffCount < required) {
                         compliance.hoursMissed++;
-                        if (isCritical) compliance.criticalMissed++;
-                        compliance.details.push({ day: DAYS[dIdx], hour, required, actual: staffCount, critical: isCritical });
+                        compliance.details.push({ day: DAYS[dIdx], hour, required, actual: staffCount });
                     }
                 });
             });
+
+            // The old `criticalMissed` field is removed for simplification as all hours are equally important minimum coverage now
+            compliance.criticalMissed = 0;
 
             return compliance;
         };
@@ -222,12 +221,7 @@
 
                 // Initialize coverage grid (what is still needed)
                 let coverageGrid = DAYS.map(() => HOURS.map((hour) => {
-                    let required = 0;
-                    if (hour >= 7 && hour < 11) { required = coverage['07-11']; }
-                    else if (hour >= 11 && hour < 15) { required = coverage['11-15']; }
-                    else if (hour >= 12 && hour < 16) { required = coverage['12-16']; }
-                    else if (hour >= 13 && hour < 17) { required = coverage['13-17']; }
-                    return required;
+                    return getRequiredStaffForHour(hour, coverage);
                 }));
 
                 // --- Iterative Shift Selection Loop ---
@@ -255,7 +249,6 @@
                                     const capacity = s.maxHours;
 
                                     // 1. Check Daily Exclusion Constraint
-                                    // NOTE: Using 'return' in a forEach callback only breaks the forEach iteration, not the outer loops.
                                     if (s.excludedDays?.[dayName]) return;
 
                                     // 2. Check Capacity/Budget Constraints
@@ -269,27 +262,21 @@
 
                                     // 3. Check Staff Time Constraints
                                     if (s.minTime > start) return;
-                                    if (s.maxTime < end) return; // THIS WAS THE CRITICAL FAILURE POINT (10 < 11 is true)
+                                    if (s.maxTime < end) return;
 
-                                    // 4. Lola's constraint is now removed.
-
-                                    // 5. Score the Shift based on coverage need
+                                    // 4. Score the Shift based on coverage need
                                     let coverageScore = 0;
-                                    let criticalCoverageScore = 0;
                                     let slotsGained = 0;
 
                                     for (let h = start; h < end; h++) {
                                         const hIdx = h - MIN_START_HOUR;
-                                        const needed = coverageGrid[dIdx][hIdx];
-
-                                        // Determine if the hour block is critical (7:00 - 11:00)
-                                        let isCriticalHour = (h >= 7 && h < 11);
-
-                                        if (needed > 0) {
-                                            coverageScore += 1;
-                                            slotsGained++;
-                                            // Corrected critical hour check to match application's 7-11 slot
-                                            if (isCriticalHour) { criticalCoverageScore += 2; }
+                                        // Ensure the hour is within the defined HOURS range (7-16)
+                                        if (hIdx >= 0 && hIdx < HOURS.length) {
+                                            const needed = coverageGrid[dIdx][hIdx];
+                                            if (needed > 0) {
+                                                coverageScore += 1; // Simple count of covered slots
+                                                slotsGained++;
+                                            }
                                         }
                                     }
 
@@ -297,10 +284,10 @@
                                         if (currentAssignedHours + duration > effectiveBudget) return;
                                         coverageScore = 0.1;
                                     } else if (slotsGained === 0) {
-                                        return;
+                                        return; // Don't pick a shift that doesn't fill a needed slot unless coverage is already met
                                     }
 
-                                    // 6. Score the Shift based on Staff Preference/Utilization
+                                    // 5. Score the Shift based on Staff Preference/Utilization
                                     const utilizationPenalty = (staffHours[staffId] + duration) / capacity;
 
                                     let preferenceBonus = 0;
@@ -309,7 +296,15 @@
                                     if (s.timePref === 'early' && start >= 11) preferenceBonus -= 3;
                                     if (s.timePref === 'late' && end <= 11) preferenceBonus -= 3;
 
-                                    let finalScore = (criticalCoverageScore * 100) + (coverageScore * 50) + preferenceBonus - (utilizationPenalty * 30);
+                                    // NEW LOGIC START: Incentivize longer shifts and re-weight scores
+                                    // Shift Length Bonus - Incentivize longer shifts (max 8 hours).
+                                    // Max bonus of 30 for an 8-hour shift, 15 for 6 hours, 0 for 4 hours.
+                                    const shiftLengthBonus = (duration - SHIFT_MIN) * 7.5; // (duration - 4) * 7.5
+
+                                    // Final score: coverage is still the highest priority, but adjusted weights.
+                                    let finalScore = (coverageScore * 35) + preferenceBonus + shiftLengthBonus - (utilizationPenalty * 20);
+
+                                    // NEW LOGIC END
 
                                     if (finalScore < 0 && currentAssignedHours > minimumRequiredWeeklyHours) return;
 
@@ -358,7 +353,9 @@
                     // Update coverage grid
                     for (let h = bestShift.start; h < bestShift.end; h++) {
                         const hIdx = h - MIN_START_HOUR;
-                        coverageGrid[bestShift.day][hIdx] = Math.max(0, coverageGrid[bestShift.day][hIdx] - 1);
+                        if (hIdx >= 0 && hIdx < HOURS.length) {
+                            coverageGrid[bestShift.day][hIdx] = Math.max(0, coverageGrid[bestShift.day][hIdx] - 1);
+                        }
                     }
                 }
                 // --- END Iterative Shift Selection Loop ---
@@ -434,7 +431,9 @@
                 return;
             }
             try {
-                await firebase.setDoc(settingsDocRef, { [key]: value }, { merge: true });
+                // Ensure coverage is stored as an object with string keys for Firebase
+                const dataToStore = key === 'coverage' ? { [key]: value } : { [key]: value };
+                await firebase.setDoc(settingsDocRef, dataToStore, { merge: true });
             } catch (e) {
                 console.error("Error updating settings:", e);
             }
@@ -551,206 +550,211 @@
             const bgClass = s.isHoliday ? 'bg-red-100/50' : 'bg-gray-100';
 
             const exclusionCheckboxes = DAYS.map(day => `
-                    <div class="flex flex-col items-center">
-                        <span class="text-sm font-bold text-gray-600 mb-1">${day}</span>
-                        <input
-                            type="checkbox"
-                            onchange="updateStaffConstraint(${s.id}, 'excludedDays_${day}', this.checked)"
-                            ${s.excludedDays?.[day] ? 'checked' : ''}
-                            class="h-5 w-5 text-red-600 border-gray-300 rounded focus:ring-red-500 disabled:opacity-50"
-                            ${disabledAttr}
-                        />
-                    </div>
-                `).join('');
+                            <div class="flex flex-col items-center">
+                                <span class="text-sm font-bold text-gray-600 mb-1">${day}</span>
+                                <input
+                                    type="checkbox"
+                                    onchange="updateStaffConstraint(${s.id}, 'excludedDays_${day}', this.checked)"
+                                    ${s.excludedDays?.[day] ? 'checked' : ''}
+                                    class="h-5 w-5 text-red-600 border-gray-300 rounded focus:ring-red-500 disabled:opacity-50"
+                                    ${disabledAttr}
+                                />
+                            </div>
+                        `).join('');
 
             const timePrefOptions = ['early', 'mid', 'late'].map(pref => `
-                    <option value="${pref}" ${s.timePref === pref ? 'selected' : ''}>${pref.charAt(0).toUpperCase() + pref.slice(1)}</option>
-                `).join('');
+                            <option value="${pref}" ${s.timePref === pref ? 'selected' : ''}>${pref.charAt(0).toUpperCase() + pref.slice(1)}</option>
+                        `).join('');
 
 
             const complianceStatus = compliance && !s.isHoliday ? `
-                    <div class="mt-3 pt-3 border-t border-gray-200">
-                        <p class="text-sm font-bold text-indigo-700 flex justify-between">
-                            <span>Assigned: <span class="${hoursClass}">${compliance.assignedHours.toFixed(1)}h</span> / <span class="font-medium">${compliance.maxHours.toFixed(1)}h</span> </span>
-                            <span>Days: <span class="${daysClass}">${compliance.assignedDays}</span> / <span class="font-medium">${compliance.maxDays}</span></span>
-                        </p>
-                    </div>
-                ` : '';
+                            <div class="mt-3 pt-3 border-t border-gray-200">
+                                <p class="text-sm font-bold text-indigo-700 flex justify-between">
+                                    <span>Assigned: <span class="${hoursClass}">${compliance.assignedHours.toFixed(1)}h</span> / <span class="font-medium">${compliance.maxHours.toFixed(1)}h</span> </span>
+                                    <span>Days: <span class="${daysClass}">${compliance.assignedDays}</span> / <span class="font-medium">${compliance.maxDays}</span></span>
+                                </p>
+                            </div>
+                        ` : '';
 
             return `
-                    <div class="p-4 rounded-xl border border-gray-200 transition-all ${bgClass}">
-                        <div class="flex justify-between items-start mb-3">
-                            <input
-                                type="text"
-                                value="${s.name}"
-                                onchange="updateStaffConstraint(${s.id}, 'name', this.value)"
-                                class="p-2 border rounded-lg text-base font-bold flex-grow mr-4 focus:ring-indigo-500 focus:border-indigo-500 transition ${s.isHoliday ? 'bg-red-100 border-red-300 text-gray-500 line-through' : 'bg-white border-gray-300 text-indigo-900'}"
-                                ${disabledAttr}
-                            />
-
-                            <div class="flex items-center space-x-3">
-                                <div class="flex items-center space-x-1">
-                                    <label class="text-sm font-semibold text-red-600 flex items-center whitespace-nowrap">Holiday</label>
+                            <div class="p-4 rounded-xl border border-gray-200 transition-all ${bgClass}">
+                                <div class="flex justify-between items-start mb-3">
                                     <input
-                                        type="checkbox"
-                                        ${s.isHoliday ? 'checked' : ''}
-                                        onchange="updateStaffConstraint(${s.id}, 'isHoliday', this.checked)"
-                                        class="h-5 w-5 text-red-600 border-gray-300 rounded focus:ring-red-500"
+                                        type="text"
+                                        value="${s.name}"
+                                        onchange="updateStaffConstraint(${s.id}, 'name', this.value)"
+                                        class="p-2 border rounded-lg text-base font-bold flex-grow mr-4 focus:ring-indigo-500 focus:border-indigo-500 transition ${s.isHoliday ? 'bg-red-100 border-red-300 text-gray-500 line-through' : 'bg-white border-gray-300 text-indigo-900'}"
+                                        ${disabledAttr}
                                     />
+
+                                    <div class="flex items-center space-x-3">
+                                        <div class="flex items-center space-x-1">
+                                            <label class="text-sm font-semibold text-red-600 flex items-center whitespace-nowrap">Holiday</label>
+                                            <input
+                                                type="checkbox"
+                                                ${s.isHoliday ? 'checked' : ''}
+                                                onchange="updateStaffConstraint(${s.id}, 'isHoliday', this.checked)"
+                                                class="h-5 w-5 text-red-600 border-gray-300 rounded focus:ring-red-500"
+                                            />
+                                        </div>
+
+                                        <button
+                                            onclick="removeStaff(${s.id})"
+                                            class="text-red-500 hover:text-red-700 p-1.5 rounded-full hover:bg-red-200 transition flex-shrink-0"
+                                            title="Remove ${s.name}"
+                                        >
+                                            ${renderIcon('minus-circle', 'w-5 h-5')}
+                                        </button>
+                                    </div>
                                 </div>
 
-                                <button
-                                    onclick="removeStaff(${s.id})"
-                                    class="text-red-500 hover:text-red-700 p-1.5 rounded-full hover:bg-red-200 transition flex-shrink-0"
-                                    title="Remove ${s.name}"
-                                >
-                                    ${renderIcon('minus-circle', 'w-5 h-5')}
-                                </button>
-                            </div>
-                        </div>
+                                <div class="grid grid-cols-5 gap-3 text-sm">
+                                    <div class="col-span-1">
+                                        <label class="text-gray-500 block text-xs font-medium">Min Start</label>
+                                        <input
+                                            type="number" min="3" max="19"
+                                            value="${s.minTime}"
+                                            onchange="updateStaffConstraint(${s.id}, 'minTime', parseInt(this.value) || 0)"
+                                            class="w-full p-2 border rounded-lg text-center focus:ring-indigo-500 focus:border-indigo-500 ${s.isHoliday ? 'bg-red-100 border-red-300 text-gray-500' : 'bg-white border-gray-300'}"
+                                            ${disabledAttr}
+                                        />
+                                    </div>
+                                    <div class="col-span-1">
+                                        <label class="text-gray-500 block text-xs font-medium">Max End</label>
+                                        <input
+                                            type="number" min="4" max="20"
+                                            value="${s.maxTime}"
+                                            onchange="updateStaffConstraint(${s.id}, 'maxTime', parseInt(this.value) || 0)"
+                                            class="w-full p-2 border rounded-lg text-center focus:ring-indigo-500 focus:border-indigo-500 ${s.isHoliday ? 'bg-red-100 border-red-300 text-gray-500' : 'bg-white border-gray-300'}"
+                                            ${disabledAttr}
+                                        />
+                                    </div>
+                                    <div class="col-span-1">
+                                        <label class="text-gray-500 block text-xs font-medium">Max Hrs</label>
+                                        <input
+                                            type="number" min="0" step="0.5"
+                                            value="${s.maxHours}"
+                                            onchange="updateStaffConstraint(${s.id}, 'maxHours', parseFloat(this.value) || 0)"
+                                            class="w-full p-2 border rounded-lg text-center focus:ring-indigo-500 focus:border-indigo-500 ${s.isHoliday ? 'bg-red-100 border-red-300 text-gray-500' : 'bg-white border-gray-300'}"
+                                            ${disabledAttr}
+                                        />
+                                    </div>
+                                    <div class="col-span-1">
+                                        <label class="text-gray-500 block text-xs font-medium">Max Days</label>
+                                        <input
+                                            type="number" min="0" max="7"
+                                            value="${s.maxDays}"
+                                            onchange="updateStaffConstraint(${s.id}, 'maxDays', parseInt(this.value) || 0)"
+                                            class="w-full p-2 border rounded-lg text-center focus:ring-indigo-500 focus:border-indigo-500 ${s.isHoliday ? 'bg-red-100 border-red-300 text-gray-500' : 'bg-white border-gray-300'}"
+                                            ${disabledAttr}
+                                        />
+                                    </div>
+                                    <div class="col-span-1">
+                                        <label class="text-gray-500 block text-xs font-medium">Pref.</label>
+                                        <select
+                                            value="${s.timePref}"
+                                            onchange="updateStaffConstraint(${s.id}, 'timePref', this.value)"
+                                            class="w-full p-2 border rounded-lg text-center focus:ring-indigo-500 focus:border-indigo-500 ${s.isHoliday ? 'bg-red-100 border-red-300 text-gray-500' : 'bg-white border-gray-300'}"
+                                            ${disabledAttr}
+                                        >
+                                            ${timePrefOptions}
+                                        </select>
+                                    </div>
+                                </div>
 
-                        <div class="grid grid-cols-5 gap-3 text-sm">
-                            <div class="col-span-1">
-                                <label class="text-gray-500 block text-xs font-medium">Min Start</label>
+                                <div class="mt-4 pt-4 border-t border-gray-200">
+                                    <label class="text-gray-700 block text-sm font-bold mb-2">Exclude Days (Cannot Work):</label>
+                                    <div class="flex justify-between px-1">
+                                        ${exclusionCheckboxes}
+                                    </div>
+                                </div>
+
                                 <input
-                                    type="number" min="3" max="19"
-                                    value="${s.minTime}"
-                                    onchange="updateStaffConstraint(${s.id}, 'minTime', parseInt(this.value) || 0)"
-                                    class="w-full p-2 border rounded-lg text-center focus:ring-indigo-500 focus:border-indigo-500 ${s.isHoliday ? 'bg-red-100 border-red-300 text-gray-500' : 'bg-white border-gray-300'}"
+                                    type="text"
+                                    value="${s.notes}"
+                                    onchange="updateStaffConstraint(${s.id}, 'notes', this.value)"
+                                    placeholder="Enter notes/specific requirements (e.g., must end by 10:00)"
+                                    class="w-full p-2 mt-3 border border-gray-300 rounded-lg text-sm text-gray-700 focus:ring-indigo-500 focus:border-indigo-500"
                                     ${disabledAttr}
                                 />
-                            </div>
-                            <div class="col-span-1">
-                                <label class="text-gray-500 block text-xs font-medium">Max End</label>
-                                <input
-                                    type="number" min="4" max="20"
-                                    value="${s.maxTime}"
-                                    onchange="updateStaffConstraint(${s.id}, 'maxTime', parseInt(this.value) || 0)"
-                                    class="w-full p-2 border rounded-lg text-center focus:ring-indigo-500 focus:border-indigo-500 ${s.isHoliday ? 'bg-red-100 border-red-300 text-gray-500' : 'bg-white border-gray-300'}"
-                                    ${disabledAttr}
-                                />
-                            </div>
-                            <div class="col-span-1">
-                                <label class="text-gray-500 block text-xs font-medium">Max Hrs</label>
-                                <input
-                                    type="number" min="0" step="0.5"
-                                    value="${s.maxHours}"
-                                    onchange="updateStaffConstraint(${s.id}, 'maxHours', parseFloat(this.value) || 0)"
-                                    class="w-full p-2 border rounded-lg text-center focus:ring-indigo-500 focus:border-indigo-500 ${s.isHoliday ? 'bg-red-100 border-red-300 text-gray-500' : 'bg-white border-gray-300'}"
-                                    ${disabledAttr}
-                                />
-                            </div>
-                            <div class="col-span-1">
-                                <label class="text-gray-500 block text-xs font-medium">Max Days</label>
-                                <input
-                                    type="number" min="0" max="7"
-                                    value="${s.maxDays}"
-                                    onchange="updateStaffConstraint(${s.id}, 'maxDays', parseInt(this.value) || 0)"
-                                    class="w-full p-2 border rounded-lg text-center focus:ring-indigo-500 focus:border-indigo-500 ${s.isHoliday ? 'bg-red-100 border-red-300 text-gray-500' : 'bg-white border-gray-300'}"
-                                    ${disabledAttr}
-                                />
-                            </div>
-                            <div class="col-span-1">
-                                <label class="text-gray-500 block text-xs font-medium">Pref.</label>
-                                <select
-                                    value="${s.timePref}"
-                                    onchange="updateStaffConstraint(${s.id}, 'timePref', this.value)"
-                                    class="w-full p-2 border rounded-lg text-center focus:ring-indigo-500 focus:border-indigo-500 ${s.isHoliday ? 'bg-red-100 border-red-300 text-gray-500' : 'bg-white border-gray-300'}"
-                                    ${disabledAttr}
-                                >
-                                    ${timePrefOptions}
-                                </select>
-                            </div>
-                        </div>
 
-                        <div class="mt-4 pt-4 border-t border-gray-200">
-                            <label class="text-gray-700 block text-sm font-bold mb-2">Exclude Days (Cannot Work):</label>
-                            <div class="flex justify-between px-1">
-                                ${exclusionCheckboxes}
+                                ${complianceStatus}
                             </div>
-                        </div>
-
-                        <input
-                            type="text"
-                            value="${s.notes}"
-                            onchange="updateStaffConstraint(${s.id}, 'notes', this.value)"
-                            placeholder="Enter notes/specific requirements (e.g., must end by 10:00)"
-                            class="w-full p-2 mt-3 border border-gray-300 rounded-lg text-sm text-gray-700 focus:ring-indigo-500 focus:border-indigo-500"
-                            ${disabledAttr}
-                        />
-
-                        ${complianceStatus}
-                    </div>
-                `;
+                        `;
         }
 
         function renderStaffConstraints() {
             const staffItemsHtml = staff.map(renderStaffConstraintItem).join('');
 
             return `
-                    <div class="lg:col-span-3 bg-white p-6 rounded-xl shadow-xl h-full flex flex-col">
-                        <div class="flex justify-between items-center mb-4 border-b pb-2">
-                            <h2 class="text-xl font-bold text-indigo-700 flex items-center">
-                                ${renderIcon('user', 'mr-2 w-5 h-5')} Staff Constraints
-                            </h2>
-                            <button
-                                onclick="openAddStaffModal()"
-                                class="flex items-center text-sm px-3 py-1 bg-indigo-100 text-indigo-600 font-semibold rounded-lg hover:bg-indigo-200 transition"
-                            >
-                                ${renderIcon('plus', 'w-4 h-4 mr-1')} Add New Staff
-                            </button>
-                        </div>
+                            <div class="lg:col-span-3 bg-white p-6 rounded-xl shadow-xl h-full flex flex-col">
+                                <div class="flex justify-between items-center mb-4 border-b pb-2">
+                                    <h2 class="text-xl font-bold text-indigo-700 flex items-center">
+                                        ${renderIcon('user', 'mr-2 w-5 h-5')} Staff Constraints
+                                    </h2>
+                                    <button
+                                        onclick="openAddStaffModal()"
+                                        class="flex items-center text-sm px-3 py-1 bg-indigo-100 text-indigo-600 font-semibold rounded-lg hover:bg-indigo-200 transition"
+                                    >
+                                        ${renderIcon('plus', 'w-4 h-4 mr-1')} Add New Staff
+                                    </button>
+                                </div>
 
-                        <div class="space-y-3 max-h-[400px] overflow-y-auto pr-2" id="staffList">
-                            ${staffItemsHtml}
-                        </div>
-                    </div>
-                `;
+                                <div class="space-y-3 max-h-[400px] overflow-y-auto pr-2" id="staffList">
+                                    ${staffItemsHtml}
+                                </div>
+                            </div>
+                        `;
         }
 
         function renderCoverageCard() {
             const requiredWeeklyHours = calculateRequiredWeeklyHours(coverage);
-            // Updated range names in coverageInputsHtml to match state
-            const coverageInputsHtml = Object.entries(coverage).map(([range, count]) => `
-                    <div class="flex justify-between items-center">
-                        <label class="text-sm font-medium text-gray-700 w-40 flex-shrink-0">
-                            ${formatHour(parseInt(range.split('-')[0]))} - ${formatHour(parseInt(range.split('-')[1]))}
-                        </label>
-                        <input
-                            type="number"
-                            min="0" max="5"
-                            value="${count}"
-                            onchange="updateSettings('coverage', { ...coverage, '${range}': parseInt(this.value) || 0 })"
-                            class="w-16 p-2 border border-gray-300 rounded-md text-center text-sm focus:ring-indigo-500 focus:border-indigo-500"
-                        />
-                        ${range === '07-11' ? '<span class="text-red-500 text-xs font-semibold w-20 text-right">CRITICAL</span>' : '<span class="w-20"></span>'}
-                    </div>
-                `).join('');
+            // Iterate over the hourly keys (7, 8, ..., 16)
+            const coverageInputsHtml = HOURS.map(hour => {
+                const key = hour.toString();
+                const count = coverage[key] ?? 0; // Use the hourly key
+                return `
+                            <div class="flex justify-between items-center">
+                                <label class="text-sm font-medium text-gray-700 w-40 flex-shrink-0">
+                                    ${formatHour(hour)} - ${formatHour(hour + 1)}
+                                </label>
+                                <input
+                                    type="number"
+                                    min="0" max="5"
+                                    value="${count}"
+                                    onchange="updateSettings('coverage', { ...coverage, '${key}': parseInt(this.value) || 0 })"
+                                    class="w-16 p-2 border border-gray-300 rounded-md text-center text-sm focus:ring-indigo-500 focus:border-indigo-500"
+                                />
+                                ${hour < 11 ? '<span class="text-red-500 text-xs font-semibold w-20 text-right">Early/Critical</span>' : '<span class="w-20"></span>'}
+                            </div>
+                        `;
+            }).join('');
 
             return `
-                    <div class="bg-white p-6 rounded-xl shadow-xl h-full">
-                        <h2 class="text-xl font-bold text-indigo-700 mb-4 flex items-center">
-                            ${renderIcon('calendar', 'mr-2 w-5 h-5')} Minimum Coverage Required
-                        </h2>
-                        <p class="text-sm text-gray-600 mb-3">Adjust the <b>minimum</b> staff needed for each time block (Sun - Sat).</p>
-                        <div class="space-y-3">
-                            ${coverageInputsHtml}
-                        </div>
+                            <div class="bg-white p-6 rounded-xl shadow-xl h-full">
+                                <h2 class="text-xl font-bold text-indigo-700 mb-4 flex items-center">
+                                    ${renderIcon('calendar', 'mr-2 w-5 h-5')} Minimum Coverage Required (Hourly)
+                                </h2>
+                                <p class="text-sm text-gray-600 mb-3">Adjust the <b>minimum</b> staff needed for each hourly block (07:00-17:00, Sun - Sat).</p>
+                                <div class="space-y-3 max-h-[300px] overflow-y-auto pr-2" id="hourlyCoverageList">
+                                    ${coverageInputsHtml}
+                                </div>
 
-                        <div class="mt-6 pt-4 border-t border-gray-200">
-                            <p class="text-sm font-bold text-gray-700">Minimum Required Weekly Hours:</p>
-                            <p class="text-xl font-extrabold text-indigo-800">${requiredWeeklyHours.toFixed(1)}h</p>
-                            <p class="text-xs text-gray-500 mt-1">This is the absolute minimum staff hours needed to meet the coverage above.</p>
-                        </div>
-                    </div>
-                `;
+                                <div class="mt-6 pt-4 border-t border-gray-200">
+                                    <p class="text-sm font-bold text-gray-700">Minimum Required Weekly Hours:</p>
+                                    <p class="text-xl font-extrabold text-indigo-800">${requiredWeeklyHours.toFixed(1)}h</p>
+                                    <p class="text-xs text-gray-500 mt-1">This is the absolute minimum staff hours needed to meet the coverage above.</p>
+                                </div>
+                            </div>
+                        `;
         }
 
         function renderOptimizationCard() {
             const budgetExceeded = constraintsMet?.budgetExceeded || false;
             const totalHours = constraintsMet?.totalHours.toFixed(1) || '0.0';
             const hoursMissed = constraintsMet?.coverageCompliance?.hoursMissed || 0;
-            const criticalMissed = constraintsMet?.coverageCompliance?.criticalMissed || 0;
+            // criticalMissed is now always 0 in the new logic, but kept for compatibility with render logic
+            const criticalMissed = 0;
             const calculateEffectiveBudget = getEffectiveBudget();
 
             const budgetStatusText = budgetExceeded
@@ -761,14 +765,14 @@
                 if (s.isHoliday) return '';
                 if (!s.hoursOk || !s.daysOk) {
                     return `
-                            <div class="flex items-center text-xs text-gray-700 font-bold">
-                                ${renderComplianceIcon(false)}
-                                <span class="ml-1">${s.name}:
-                                    ${!s.hoursOk ? `<span class="text-red-600 ml-1"> (Capacity Exceeded: ${s.assignedHours.toFixed(1)}/${s.totalCapacity.toFixed(1)})</span>` : ''}
-                                    ${!s.daysOk ? `<span class="text-red-600 ml-1"> (Max Days Exceeded: ${s.assignedDays}/${s.maxDays})</span>` : ''}
-                                </span>
-                            </div>
-                        `;
+                                    <div class="flex items-center text-xs text-gray-700 font-bold">
+                                        ${renderComplianceIcon(false)}
+                                        <span class="ml-1">${s.name}:
+                                            ${!s.hoursOk ? `<span class="text-red-600 ml-1"> (Capacity Exceeded: ${s.assignedHours.toFixed(1)}/${s.totalCapacity.toFixed(1)})</span>` : ''}
+                                            ${!s.daysOk ? `<span class="text-red-600 ml-1"> (Max Days Exceeded: ${s.assignedDays}/${s.maxDays})</span>` : ''}
+                                        </span>
+                                    </div>
+                                `;
                 }
                 return '';
             }).join('');
@@ -776,103 +780,103 @@
             const allActiveStaffOk = constraintsMet && staffComplianceHtml.trim() === '';
 
             return `
-                    <div class="bg-indigo-50 p-6 rounded-xl shadow-xl flex flex-col justify-between">
-                        <h2 class="text-xl font-bold text-indigo-700 mb-4 flex items-center">
-                            ${renderIcon('maximize-2', 'mr-2 w-5 h-5')} Optimization & Budget
-                        </h2>
+                            <div class="bg-indigo-50 p-6 rounded-xl shadow-xl flex flex-col justify-between">
+                                <h2 class="text-xl font-bold text-indigo-700 mb-4 flex items-center">
+                                    ${renderIcon('maximize-2', 'mr-2 w-5 h-5')} Optimization & Budget
+                                </h2>
 
-                        <div class="mb-4">
-                            <label class="text-sm font-semibold text-gray-700 block mb-1">Target Weekly Staff Hours Budget (W/O Buffer)</label>
-                            <input
-                                type="number"
-                                min="${calculateRequiredWeeklyHours(coverage).toFixed(1)}"
-                                value="${weeklyBudget}"
-                                onchange="updateSettings('weeklyBudget', parseFloat(this.value) || 0)"
-                                class="w-full p-2 border border-indigo-300 rounded-md text-center text-lg font-bold focus:ring-indigo-500 focus:border-indigo-500"
-                            />
-                            <p class="text-xs text-gray-500 mt-1">The user-defined base budget.</p>
-                        </div>
-
-                        <div class="mb-4 p-3 bg-indigo-100 rounded-lg border border-indigo-200">
-                            <p class="text-sm font-semibold text-gray-700 flex justify-between">
-                                <span>Base Budget:</span>
-                                <span class="font-extrabold text-gray-800">${weeklyBudget.toFixed(1)}h</span>
-                            </p>
-                            <p class="text-sm font-semibold text-gray-700 flex justify-between">
-                                <span>${(BUDGET_BUFFER * 100).toFixed(0)}% Buffer:</span>
-                                <span class="font-extrabold text-green-700"> +${((calculateEffectiveBudget - weeklyBudget) || 0).toFixed(1)}h</span>
-                            </p>
-                            <div class="border-t border-indigo-300 mt-1 pt-1 flex justify-between">
-                                <p class="font-bold text-lg text-indigo-800">Effective Budget Cap:</p>
-                                <p class="font-extrabold text-lg text-indigo-800">${calculateEffectiveBudget.toFixed(1)}h</p>
-                            </div>
-                            <p class="text-xs text-gray-500 mt-1">The generator will cap assigned hours at this *effective* amount.</p>
-                        </div>
-
-                        ${constraintsMet ? `
-                            <div class="mb-4 space-y-2">
-                                <p class="text-gray-700 font-semibold border-b border-indigo-200 pb-2">
-                                    Total Assigned Hours:
-                                    <span class="text-2xl font-extrabold ml-2 ${budgetExceeded ? 'text-red-700' : 'text-indigo-800'}">
-                                        ${totalHours}h
-                                    </span>
-                                </p>
-
-                                <div class="flex items-center text-sm">
-                                    ${renderComplianceIcon(!budgetExceeded)}
-                                    <span class="ml-2 ${budgetExceeded ? 'text-red-600 font-bold' : 'text-green-700'}">
-                                        ${budgetStatusText}
-                                    </span>
+                                <div class="mb-4">
+                                    <label class="text-sm font-semibold text-gray-700 block mb-1">Target Weekly Staff Hours Budget (W/O Buffer)</label>
+                                    <input
+                                        type="number"
+                                        min="${calculateRequiredWeeklyHours(coverage).toFixed(1)}"
+                                        value="${weeklyBudget}"
+                                        onchange="updateSettings('weeklyBudget', parseFloat(this.value) || 0)"
+                                        class="w-full p-2 border border-indigo-300 rounded-md text-center text-lg font-bold focus:ring-indigo-500 focus:border-indigo-500"
+                                    />
+                                    <p class="text-xs text-gray-500 mt-1">The user-defined base budget.</p>
                                 </div>
 
-                                <div class="pt-2 border-t border-indigo-200">
-                                    <p class="font-semibold text-sm mb-1">Coverage Status:</p>
-                                    <div class="flex items-center text-sm">
-                                        ${renderComplianceIcon(hoursMissed === 0)}
-                                        <span class="ml-2 ${hoursMissed > 0 ? 'text-red-600 font-bold' : 'text-green-700'}">
-                                            ${hoursMissed} hour(s) missed minimum required coverage.
-                                        </span>
+                                <div class="mb-4 p-3 bg-indigo-100 rounded-lg border border-indigo-200">
+                                    <p class="text-sm font-semibold text-gray-700 flex justify-between">
+                                        <span>Base Budget:</span>
+                                        <span class="font-extrabold text-gray-800">${weeklyBudget.toFixed(1)}h</span>
+                                    </p>
+                                    <p class="text-sm font-semibold text-gray-700 flex justify-between">
+                                        <span>${(BUDGET_BUFFER * 100).toFixed(0)}% Buffer:</span>
+                                        <span class="font-extrabold text-green-700"> +${((calculateEffectiveBudget - weeklyBudget) || 0).toFixed(1)}h</span>
+                                    </p>
+                                    <div class="border-t border-indigo-300 mt-1 pt-1 flex justify-between">
+                                        <p class="font-bold text-lg text-indigo-800">Effective Budget Cap:</p>
+                                        <p class="font-extrabold text-lg text-indigo-800">${calculateEffectiveBudget.toFixed(1)}h</p>
                                     </div>
-                                    ${criticalMissed > 0 ? '<p class="text-xs text-red-500 mt-1 ml-4 font-semibold">(' + criticalMissed + ' critical hours missed!)</p>' : ''}
+                                    <p class="text-xs text-gray-500 mt-1">The generator will cap assigned hours at this *effective* amount.</p>
                                 </div>
 
-                                <div class="pt-2 border-t border-indigo-200">
-                                    <p class="font-semibold text-sm mb-1">Staff Constraint Checks:</p>
-                                    ${staffComplianceHtml || `<div class="flex items-center text-sm text-green-700">${renderIcon('check-circle', 'mr-1 w-4 h-4')} All active staff constraints met.</div>`}
-                                </div>
-                            </div>
-                        ` : ''}
+                                ${constraintsMet ? `
+                                    <div class="mb-4 space-y-2">
+                                        <p class="text-gray-700 font-semibold border-b border-indigo-200 pb-2">
+                                            Total Assigned Hours:
+                                            <span class="text-2xl font-extrabold ml-2 ${budgetExceeded ? 'text-red-700' : 'text-indigo-800'}">
+                                                ${totalHours}h
+                                            </span>
+                                        </p>
 
-                        <button
-                            onclick="optimizeSchedule()"
-                            ${isGenerating ? 'disabled' : ''}
-                            class="w-full py-3 px-4 rounded-xl text-white font-bold transition duration-300 shadow-lg ${isGenerating ? 'bg-indigo-400 cursor-not-allowed' : 'bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800'
+                                        <div class="flex items-center text-sm">
+                                            ${renderComplianceIcon(!budgetExceeded)}
+                                            <span class="ml-2 ${budgetExceeded ? 'text-red-600 font-bold' : 'text-green-700'}">
+                                                ${budgetStatusText}
+                                            </span>
+                                        </div>
+
+                                        <div class="pt-2 border-t border-indigo-200">
+                                            <p class="font-semibold text-sm mb-1">Coverage Status:</p>
+                                            <div class="flex items-center text-sm">
+                                                ${renderComplianceIcon(hoursMissed === 0)}
+                                                <span class="ml-2 ${hoursMissed > 0 ? 'text-red-600 font-bold' : 'text-green-700'}">
+                                                    ${hoursMissed} hour(s) missed minimum required coverage.
+                                                </span>
+                                            </div>
+                                            ${criticalMissed > 0 ? '<p class="text-xs text-red-500 mt-1 ml-4 font-semibold">(' + criticalMissed + ' critical hours missed!)</p>' : ''}
+                                        </div>
+
+                                        <div class="pt-2 border-t border-indigo-200">
+                                            <p class="font-semibold text-sm mb-1">Staff Constraint Checks:</p>
+                                            ${staffComplianceHtml || `<div class="flex items-center text-sm text-green-700">${renderIcon('check-circle', 'mr-1 w-4 h-4')} All active staff constraints met.</div>`}
+                                        </div>
+                                    </div>
+                                ` : ''}
+
+                                <button
+                                    onclick="optimizeSchedule()"
+                                    ${isGenerating ? 'disabled' : ''}
+                                    class="w-full py-3 px-4 rounded-xl text-white font-bold transition duration-300 shadow-lg ${isGenerating ? 'bg-indigo-400 cursor-not-allowed' : 'bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800'
                 } flex items-center justify-center"
-                        >
-                            ${renderIcon('refresh-cw', `mr-2 w-4 h-4 ${isGenerating ? 'animate-spin' : ''}`)}
-                            ${isGenerating ? 'Optimizing...' : 'Generate New Schedule'}
-                        </button>
-                    </div>
-                `;
+                                >
+                                    ${renderIcon('refresh-cw', `mr-2 w-4 h-4 ${isGenerating ? 'animate-spin' : ''}`)}
+                                    ${isGenerating ? 'Optimizing...' : 'Generate New Schedule'}
+                                </button>
+                            </div>
+                        `;
         }
 
         function renderScheduleTable() {
             if (!schedule) return '';
 
             const shortfallAlert = constraintsMet && constraintsMet.coverageCompliance.hoursMissed > 0 ? `
-                    <div class="mt-4 p-3 bg-yellow-100 border border-yellow-400 rounded-lg text-sm text-yellow-800">
-                        <p class="font-semibold">⚠️ Coverage Shortfalls Identified:</p>
-                        <ul class="list-disc ml-4 mt-1 space-y-0.5">
-                            ${constraintsMet.coverageCompliance.details.slice(0, 5).map((detail) => `
-                                <li>
-                                    ${detail.day} at ${formatHour(detail.hour)} (${detail.critical ? 'CRITICAL' : 'Regular'}): Needs ${detail.required}, has ${detail.actual}.
-                                </li>
-                            `).join('')}
-                            ${constraintsMet.coverageCompliance.details.length > 5 ? `<li>... and ${constraintsMet.coverageCompliance.details.length - 5} more shortfalls.</li>` : ''}
-                        </ul>
-                        <p class="mt-2 text-xs">To fix this, increase the <b>Target Weekly Staff Hours Budget</b> or adjust individual staff constraints (Max Hours/Days, Min/Max Time window).</p>
-                    </div>
-                ` : '';
+                            <div class="mt-4 p-3 bg-yellow-100 border border-yellow-400 rounded-lg text-sm text-yellow-800">
+                                <p class="font-semibold">⚠️ Coverage Shortfalls Identified:</p>
+                                <ul class="list-disc ml-4 mt-1 space-y-0.5">
+                                    ${constraintsMet.coverageCompliance.details.slice(0, 5).map((detail) => `
+                                        <li>
+                                            ${detail.day} at ${formatHour(detail.hour)} - ${formatHour(detail.hour + 1)}: Needs ${detail.required}, has ${detail.actual}.
+                                        </li>
+                                    `).join('')}
+                                    ${constraintsMet.coverageCompliance.details.length > 5 ? `<li>... and ${constraintsMet.coverageCompliance.details.length - 5} more shortfalls.</li>` : ''}
+                                </ul>
+                                <p class="mt-2 text-xs">To fix this, increase the <b>Target Weekly Staff Hours Budget</b> or adjust individual staff constraints (Max Hours/Days, Min/Max Time window).</p>
+                            </div>
+                        ` : '';
 
             const tableRows = staff.map(s => {
                 const compliance = constraintsMet?.staffCompliance.find(c => c.id === s.id);
@@ -884,10 +888,10 @@
                 const dayCells = DAYS.map(day => {
                     const dayShifts = schedule[day]?.filter(shift => shift.staffId === s.id) || [];
                     const shiftHtml = dayShifts.map((shift, index) => `
-                            <div key="${index}" class="text-xs font-medium text-gray-800 bg-indigo-100 rounded-md px-1 my-0.5">
-                                ${formatHour(shift.start).substring(0, 5)} - ${formatHour(shift.end).substring(0, 5)} <span class="text-indigo-600 font-bold ml-1">(${shift.duration}h)</span>
-                            </div>
-                        `).join('');
+                                    <div key="${index}" class="text-xs font-medium text-gray-800 bg-indigo-100 rounded-md px-1 my-0.5">
+                                        ${formatHour(shift.start).substring(0, 5)} - ${formatHour(shift.end).substring(0, 5)} <span class="text-indigo-600 font-bold ml-1">(${shift.duration}h)</span>
+                                    </div>
+                                `).join('');
 
                     let dayTag = '';
                     if (s.isHoliday && dayShifts.length === 0) dayTag = '<span class="text-red-400 text-xs">(Hol)</span>';
@@ -898,16 +902,16 @@
                 }).join('');
 
                 return `
-                        <tr class="${rowClass} hover:bg-gray-50">
-                            <td class="px-3 py-2 whitespace-nowrap text-sm font-medium sticky left-0 z-20 sticky-col ${stickyColClass}">
-                                ${s.name}
-                            </td>
-                            ${dayCells}
-                            <td class="px-3 py-2 whitespace-nowrap text-sm font-bold ${hoursClass}">
-                                ${assignedHours.toFixed(1)}
-                            </td>
-                        </tr>
-                    `;
+                                <tr class="${rowClass} hover:bg-gray-50">
+                                    <td class="px-3 py-2 whitespace-nowrap text-sm font-medium sticky left-0 z-20 sticky-col ${stickyColClass}">
+                                        ${s.name}
+                                    </td>
+                                    ${dayCells}
+                                    <td class="px-3 py-2 whitespace-nowrap text-sm font-bold ${hoursClass}">
+                                        ${assignedHours.toFixed(1)}
+                                    </td>
+                                </tr>
+                            `;
             }).join('');
 
             // Coverage Row
@@ -918,55 +922,51 @@
                         (hour >= shift.start && hour < shift.end)
                     ).length;
 
-                    let required = 0;
-                    if (hour >= 7 && hour < 11) { required = coverage['07-11']; }
-                    else if (hour >= 11 && hour < 15) { required = coverage['11-15']; }
-                    else if (hour >= 12 && hour < 16) { required = coverage['12-16']; }
-                    else if (hour >= 13 && hour < 17) { required = coverage['13-17']; }
+                    const required = getRequiredStaffForHour(hour, coverage);
 
                     const isUnderstaffed = staffCount < required;
                     const timeLabel = formatHour(hour).substring(0, 5);
 
                     return `
-                            <span
-                                class="inline-block px-1 rounded-md text-center text-xs ${isUnderstaffed ? 'bg-red-300 text-red-900 font-extrabold' : 'bg-green-200 text-green-800'}"
-                                title="${timeLabel} - Required: ${required}, Actual: ${staffCount}"
-                            >
-                                ${staffCount}/${required}
-                            </span>
-                        `;
+                                    <span
+                                        class="inline-block px-1 rounded-md text-center text-xs ${isUnderstaffed ? 'bg-red-300 text-red-900 font-extrabold' : 'bg-green-200 text-green-800'}"
+                                        title="${timeLabel} - Required: ${required}, Actual: ${staffCount}"
+                                    >
+                                        ${staffCount}/${required}
+                                    </span>
+                                `;
                 }).join('');
 
                 return `<td class="px-3 py-1 whitespace-nowrap text-xs text-indigo-900"><div class="flex flex-wrap gap-1">${hourBlocks}</div></td>`;
             }).join('');
 
             return `
-                    <div class="mt-8 bg-white p-6 rounded-xl shadow-xl overflow-x-auto">
-                        <h2 class="text-2xl font-bold text-indigo-700 mb-4">Generated Weekly Schedule</h2>
-                        <div class="table-container">
-                            <table class="schedule-table divide-y divide-gray-200">
-                                <thead class="sticky top-0 z-10 bg-white">
-                                    <tr class="bg-indigo-50">
-                                        <th class="px-3 py-3 text-left text-xs font-medium text-indigo-700 uppercase tracking-wider sticky left-0 z-30 sticky-col border-b border-gray-200">Staff</th>
-                                        ${DAYS.map(day => `<th class="px-3 py-3 text-left text-xs font-medium text-indigo-700 uppercase tracking-wider border-b border-gray-200">${day}</th>`).join('')}
-                                        <th class="px-3 py-3 text-left text-xs font-medium text-indigo-700 uppercase tracking-wider border-b border-gray-200">Total H</th>
-                                    </tr>
-                                </thead>
-                                <tbody class="divide-y divide-gray-200">
-                                    ${tableRows}
-                                    <tr class="bg-indigo-100 border-t-2 border-indigo-300 font-bold">
-                                        <td class="px-3 py-2 whitespace-nowrap text-xs text-indigo-900 sticky left-0 z-20 bg-indigo-100 sticky-col">
-                                            HOURLY COVERAGE (Actual / Min)
-                                        </td>
-                                        ${coverageCells}
-                                        <td></td>
-                                    </tr>
-                                </tbody>
-                            </table>
-                        </div>
-                        ${shortfallAlert}
-                    </div>
-                `;
+                            <div class="mt-8 bg-white p-6 rounded-xl shadow-xl overflow-x-auto">
+                                <h2 class="text-2xl font-bold text-indigo-700 mb-4">Generated Weekly Schedule</h2>
+                                <div class="table-container">
+                                    <table class="schedule-table divide-y divide-gray-200">
+                                        <thead class="sticky top-0 z-10 bg-white">
+                                            <tr class="bg-indigo-50">
+                                                <th class="px-3 py-3 text-left text-xs font-medium text-indigo-700 uppercase tracking-wider sticky left-0 z-30 sticky-col border-b border-gray-200">Staff</th>
+                                                ${DAYS.map(day => `<th class="px-3 py-3 text-left text-xs font-medium text-indigo-700 uppercase tracking-wider border-b border-gray-200">${day}</th>`).join('')}
+                                                <th class="px-3 py-3 text-left text-xs font-medium text-indigo-700 uppercase tracking-wider border-b border-gray-200">Total H</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody class="divide-y divide-gray-200">
+                                            ${tableRows}
+                                            <tr class="bg-indigo-100 border-t-2 border-indigo-300 font-bold">
+                                                <td class="px-3 py-2 whitespace-nowrap text-xs text-indigo-900 sticky left-0 z-20 bg-indigo-100 sticky-col">
+                                                    HOURLY COVERAGE (Actual / Min)
+                                                </td>
+                                                ${coverageCells}
+                                                <td></td>
+                                            </tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                                ${shortfallAlert}
+                            </div>
+                        `;
         }
 
         // --- MAIN RENDER LOOP ---
@@ -975,45 +975,45 @@
 
             if (!isAuthReady) {
                 appDiv.innerHTML = `
-                        <div class="min-h-screen flex items-center justify-center bg-gray-50">
-                            <div class="text-center p-12">
-                                ${renderIcon('settings', 'animate-spin h-6 w-6 mr-3 text-indigo-600 inline-block')}
-                                <p class="mt-2 text-gray-600">Loading application data...</p>
-                            </div>
-                        </div>
-                    `;
+                                <div class="min-h-screen flex items-center justify-center bg-gray-50">
+                                    <div class="text-center p-12">
+                                        ${renderIcon('settings', 'animate-spin h-6 w-6 mr-3 text-indigo-600 inline-block')}
+                                        <p class="mt-2 text-gray-600">Loading application data...</p>
+                                    </div>
+                                </div>
+                            `;
                 // Render icons after HTML insertion
                 lucide.createIcons();
                 return;
             }
 
             const headerHtml = `
-                    <h1 class="text-3xl font-extrabold text-indigo-800 mb-2 flex items-center">
-                        ${renderIcon('settings', 'mr-3 w-8 h-8')} Hot Food Schedule Optimizer
-                    </h1>
-                    ${firestoreError ? `
-                        <div class="p-3 bg-yellow-100 text-yellow-800 rounded-lg mb-4 border border-yellow-300">
-                            <p class="font-semibold">Data Warning:</p>
-                            <p class="text-sm">${firestoreError} Changes are currently not being saved permanently.</p>
-                        </div>
-                    ` : ''}
-                    <p class="text-gray-600 mb-6">
-                        Defines staff constraints and coverage requirements to generate a schedule within your budget. <b>All assigned shifts are 4 to 8 hours long.</b>
-                    </p>
-                `;
+                            <h1 class="text-3xl font-extrabold text-indigo-800 mb-2 flex items-center">
+                                ${renderIcon('settings', 'mr-3 w-8 h-8')} Hot Food Schedule Optimizer
+                            </h1>
+                            ${firestoreError ? `
+                                <div class="p-3 bg-yellow-100 text-yellow-800 rounded-lg mb-4 border border-yellow-300">
+                                    <p class="font-semibold">Data Warning:</p>
+                                    <p class="text-sm">${firestoreError} Changes are currently not being saved permanently.</p>
+                                </div>
+                            ` : ''}
+                            <p class="text-gray-600 mb-6">
+                                Defines staff constraints and hourly coverage requirements (07:00-17:00) to generate a schedule within your budget. <b>All assigned shifts are 4 to 8 hours long.</b>
+                            </p>
+                        `;
 
             // Replicate the 60/40 layout using a 5-column grid on large screens
             const mainContentHtml = `
-                    <div class="grid grid-cols-1 lg:grid-cols-5 gap-6 mb-8">
-                        ${renderStaffConstraints()}
+                            <div class="grid grid-cols-1 lg:grid-cols-5 gap-6 mb-8">
+                                ${renderStaffConstraints()}
 
-                        <div class="lg:col-span-2 grid grid-cols-1 gap-6">
-                            ${renderCoverageCard()}
-                            ${renderOptimizationCard()}
-                        </div>
-                    </div>
-                    ${schedule ? renderScheduleTable() : ''}
-                `;
+                                <div class="lg:col-span-2 grid grid-cols-1 gap-6">
+                                    ${renderCoverageCard()}
+                                    ${renderOptimizationCard()}
+                                </div>
+                            </div>
+                            ${schedule ? renderScheduleTable() : ''}
+                        `;
 
             appDiv.innerHTML = headerHtml + mainContentHtml;
 
@@ -1121,11 +1121,26 @@
                     firebase.onSnapshot(settingsDocRef, (docSnap) => {
                         if (docSnap.exists()) {
                             const data = docSnap.data();
-                            coverage = data.coverage || coverage;
+                            // Ensure coverage is parsed with integer keys from stored strings if needed
+                            const storedCoverage = data.coverage || {};
+                            // Convert Firestore string keys back to numbers for the local coverage object keys
+                            const newCoverage = Object.keys(storedCoverage).reduce((acc, key) => {
+                                // Only process keys that can be converted to an integer and are in the HOURS range
+                                const hour = parseInt(key);
+                                if (HOURS.includes(hour)) {
+                                    acc[hour] = storedCoverage[key];
+                                }
+                                return acc;
+                            }, {});
+
+                            // Merge with default to ensure all hours are present if they were not stored
+                            coverage = { ...HOURS.reduce((acc, h) => ({ ...acc, [h]: 1 }), {}), ...newCoverage };
                             weeklyBudget = data.weeklyBudget || weeklyBudget;
                         } else {
                             // Initialize settings if document doesn't exist
-                            firebase.setDoc(settingsDocRef, { coverage: coverage, weeklyBudget: weeklyBudget });
+                            // Convert initial coverage object keys to strings for storage
+                            const coverageForStore = Object.keys(coverage).reduce((acc, key) => ({ ...acc, [key.toString()]: coverage[key] }), {});
+                            firebase.setDoc(settingsDocRef, { coverage: coverageForStore, weeklyBudget: weeklyBudget });
                         }
                         optimizeSchedule(); // Re-run optimization on settings change
                     }, (error) => {
